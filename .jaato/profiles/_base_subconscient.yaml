@@ -1,0 +1,34 @@
+# Tier-1 base for the associative half — PROVIDER-AGNOSTIC.
+name: _base_subconscient
+description: >
+  The associative half of a continuous monologue. Receives each thought and
+  returns something complementary: an angle not considered, a tension, a
+  memory, a reframing.
+
+  Declares NO completion_payload_schema, for the same reason as
+  _base_conscient — withholding it is what removes the ability to exit.
+plugins:
+  - subagent(mode:preload, tools:[list_siblings,send_to_sibling])
+  - memory
+gc:
+  type: hybrid
+  threshold_percent: 70.0
+  preserve_recent_turns: 4
+plugin_configs:
+  permission:
+    evaluators:
+      send_to_sibling: policies/pace_monologue.py
+    policy:
+      defaultPolicy: deny
+      whitelist:
+        tools: [send_to_sibling, list_siblings]
+
+# Runs hotter than the deliberate half. README §11 Q4 records that this
+# asymmetry is an aesthetic guess and may be exactly backwards; it is one
+# number in one file precisely so it can be tested.
+env:
+  MONOLOGUE_INTERVAL_SECONDS: "8.0"
+  MONOLOGUE_THOUGHT_CEILING: "1000"
+
+# NO budget_control — README §7.4, certified as C3.
+suppress_base_instructions: false

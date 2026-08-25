@@ -1,0 +1,316 @@
+#!/usr/bin/env python3
+"""Perpetual monologue driver.  Opens, observes, nudges, reaps.
+
+Two sessions — `conscient` and `subconscient` — keep each other alive by
+ending every turn with `send_to_sibling`.  A message to an IDLE sibling
+starts a turn on it, so the exchange is self-sustaining and this driver is
+not in the loop.  After kickoff it makes exactly one kind of outbound call:
+a nudge when the stream has gone silent.
+
+WHAT IS VERIFIED AND WHAT IS NOT (README §4.1, §7.15):
+  - `accepted` starts a turn on the peer — CERTIFIED on jaato 4138a9a5.
+  - An idle sibling stays loaded across a second session's creation —
+    MEASURED on 4138a9a5.
+  - Everything in the shutdown path below — that a budget ceiling emits
+    SessionTerminatedEvent(reason="budget_exhausted") to a cascade observer
+    at all, that `details` carries per-dimension usage — is READ FROM
+    SOURCE AND NEVER OBSERVED.  It runs once, at the end, when nobody is
+    watching.  Treat a clean exit as unproven until you have seen one.
+"""
+import asyncio
+import contextlib
+import json
+import os
+import time
+import uuid
+
+from jaato_sdk import ClientType, EventType, IPCRecoveryClient
+
+REPO = os.path.dirname(os.path.abspath(__file__))
+
+#: Points AT `.jaato`, not the repo root: profile discovery scans
+#: `<config_root>/profiles`, so the root finds nothing — and finds it
+#: WITHOUT an error, because an empty profile set is legal.
+CONFIG_ROOT = os.path.join(REPO, ".jaato")
+ENV_FILE = os.path.join(REPO, ".env")
+
+
+def _load_env_file(path):
+    """Read .env into this process, before any module constant reads it.
+
+    The daemon reads this same file to build each SESSION's env; these
+    clients need it for their OWN constants (socket path, ceiling), which
+    are bound at import — so the load has to happen here, above them.
+    Existing environment wins, so `VAR=x python3 <script>` still overrides.
+    """
+    if not os.path.isfile(path):
+        return
+    with open(path) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.split("   #")[0].strip()
+            if key and key not in os.environ:
+                os.environ[key] = value
+
+
+_load_env_file(ENV_FILE)
+
+#: Short on purpose: AF_UNIX caps a socket path at 108 bytes and fails
+#: opaquely past it.
+SOCKET = os.environ.get("JAATO_IPC_SOCKET", "/tmp/monologue.sock")
+
+#: Seconds of event silence before the watchdog nudges.  Generous: a paced
+#: volley is 30s on the conscient side plus a model turn, so anything under
+#: ~90s would nudge a healthy loop.
+STALL_AFTER = 180.0
+
+#: The ceiling.  This is not a safety net, it is the business model — you
+#: are paying for a mind to exist rather than to answer.  It lives in .env
+#: rather than here so that changing what you are willing to spend is a
+#: config edit, and so that a missing value stops the run instead of
+#: quietly selecting someone else's idea of a reasonable bill.
+def _ceiling():
+    usd = os.environ.get("MONOLOGUE_CEILING_USD")
+    turns = os.environ.get("MONOLOGUE_CEILING_TURNS")
+    if usd is None or turns is None:
+        raise SystemExit(
+            "MONOLOGUE_CEILING_USD and MONOLOGUE_CEILING_TURNS must be set "
+            "in .env. There is no default: the ceiling is the only real "
+            "stop this design has (README §7.7), and guessing it for you "
+            "would be guessing how much money you are willing to lose.")
+    return {"usd": float(usd), "turns": int(turns)}
+
+
+def _stamp():
+    return time.strftime("%H:%M:%S")
+
+
+#: Streaming deltas arrive as many AGENT_OUTPUT events per utterance — the
+#: first run rendered one token per line, which is unreadable and hides the
+#: shape of a thought. Buffer per agent, flush when that agent stops.
+_buf = {}
+
+
+def _flush(who):
+    text = "".join(_buf.pop(who, [])).strip()
+    if text:
+        print(f"\n[{_stamp()}] {who}:\n{text}\n", flush=True)
+
+
+def render(ev):
+    """The monologue as one document, both halves interleaved.
+
+    An attached client's events() sees only its own session; this is the
+    cascade stream, so it sees both. That interleaving IS the trajectory
+    view — the thought stream reassembled from two halves that each only
+    saw their own side.
+    """
+    kind = getattr(ev, "type", None)
+    who = getattr(ev, "agent_id", None) or "?"
+    if kind == EventType.AGENT_OUTPUT:
+        _buf.setdefault(who, []).append(getattr(ev, "text", "") or "")
+    elif kind == EventType.TOOL_CALL_END and getattr(ev, "tool_name", "") == "send_to_sibling":
+        _flush(who)
+        ok = "→" if getattr(ev, "success", False) else "✗"
+        print(f"[{_stamp()}] {who} {ok} send_to_sibling", flush=True)
+    elif kind == EventType.AGENT_STATUS_CHANGED and getattr(ev, "status", "") == "done":
+        _flush(who)
+
+
+def render_ceiling(details):
+    d = details or {}
+    print(f"\n[{_stamp()}] ── the ceiling ──", flush=True)
+    print(f"  {d.get('reason', 'budget exhausted')}", flush=True)
+    for dim, used in sorted((d.get("usage") or {}).items()):
+        print(f"  {dim}: {used}", flush=True)
+
+
+def render_cold(ev):
+    print(f"[{_stamp()}] !! a half went cold: {ev.error_message}", flush=True)
+    print("   Not expected in a running loop — cold is reached by a driver "
+          "attaching away, not by resting. If this fires, something "
+          "attached away from it. See README §11 Q2.", flush=True)
+
+
+def render_backpressure(ev):
+    print(f"[{_stamp()}] .. backpressure: {ev.error_message}", flush=True)
+
+
+def new_client():
+    """IPCRecoveryClient, not IPCClient: this process is long-lived by
+    definition and must survive a daemon restart."""
+    return IPCRecoveryClient(
+        SOCKET,
+        client_type=ClientType.API,   # API keeps signal_completion; TERMINAL/WEB strip it
+        auto_start=False,             # start your own daemon; see RUNNING.md
+        env_file=ENV_FILE,            # never None — the handshake crashes on None
+        workspace_path=REPO,
+        config_root=CONFIG_ROOT,
+    )
+
+
+async def main():
+    client = new_client()
+    if not await client.connect(timeout=120.0):
+        raise SystemExit("daemon did not start; run jaato-doctor")
+
+    cid = uuid.uuid4().hex
+    print(f"[{_stamp()}] cascade {cid}", flush=True)
+
+    # Ceiling FIRST: sessions created under this cid are clamped to
+    # min(profile, cascade_remaining) at spawn, and a cid with no headroom
+    # REFUSES the spawn rather than starting something that cannot run.
+    limits = _ceiling()
+    print(f"[{_stamp()}] ceiling {limits}", flush=True)
+    await client.cascade_budget_set(cid, limits=limits)
+
+    # subconscient FIRST so it is addressable before conscient sends to it.
+    #
+    # Creating the conscient attaches this client to it, which is an
+    # attach-away from the subconscient — the same gesture the coordination
+    # example uses DELIBERATELY to put a sibling to sleep. It was measured
+    # not to unload an idle peer on 4138a9a5 (README §11 Q2), which is why
+    # this order is safe as written rather than merely untested.
+    sub = await client.create_session(
+        profile="subconscient", agent="subconscient",
+        sibling_name="subconscient", cascade_driver_id=cid, timeout=60.0)
+    con = await client.create_session(
+        profile="conscient", agent="conscient",
+        sibling_name="conscient", cascade_driver_id=cid, timeout=60.0)
+    if not sub or not con:
+        raise SystemExit(f"a half did not start (sub={sub} con={con})")
+
+    # EXPLICIT, not incidental. create_session attaches the creating client
+    # (session_manager.py:6057), so without this the driver is attached to
+    # whichever session it happened to create last and inject_prompt targets
+    # it by luck. Here it happens to be a no-op — conscient was created last
+    # and is already current — and saying so is the point: the coordination
+    # example lost hours to an attach that "left nothing".
+    await client.attach_session(con)
+
+    # The whisper client's address book.
+    with open(os.path.join(CONFIG_ROOT, "monologue.json"), "w") as fh:
+        json.dump({"cid": cid, "conscient_session_id": con,
+                   "subconscient_session_id": sub,
+                   "started_at": time.time()}, fh)
+
+    last_activity = time.monotonic()
+    shutdown = asyncio.Event()      # set by the ceiling; awaited by both tasks
+
+    async def on_failed_send(ev):
+        # The receipt STATUS is not on the event — only the prose the
+        # receipt's `error` key carried (jaato_session.py:6311). So this
+        # matches a sentence, which is brittle; see README §7.12.
+        msg = ev.error_message or ""
+        if "is resting (unloaded)" in msg:
+            render_cold(ev)
+        elif "has not been idle since" in msg:
+            render_backpressure(ev)     # peer alive and busy; "Let it work."
+        else:
+            print(f"[{_stamp()}] !! unrecoverable: {msg}", flush=True)
+            shutdown.set()              # no_such_sibling
+
+    async def observe():
+        nonlocal last_activity
+        # aclosing(): `async for ... break` does NOT run the iterator's
+        # finally, so cascade.unregister would wait for GC or the 50ms
+        # disconnect backstop (ipc.py:2291, "Cleanup contract").
+        async with contextlib.aclosing(
+                client.cascade_events(cid, event_types=None,
+                                      role="owner")) as stream:
+            async for ev in stream:
+                render(ev)
+                # Only a THOUGHT resets the stall clock. Keying on any event
+                # made the watchdog useless in run 1: the cascade stream
+                # emits status/telemetry events continuously, so a mind that
+                # had stopped thinking still looked alive and the nudge never
+                # fired (it was 40s overdue when the run was stopped).
+                if ((getattr(ev, "type", None) == EventType.AGENT_OUTPUT
+                     and (getattr(ev, "text", "") or "").strip())
+                        or (getattr(ev, "type", None) == EventType.TOOL_CALL_END
+                            and getattr(ev, "tool_name", "") == "send_to_sibling")):
+                    last_activity = time.monotonic()
+
+                # THE CEILING. A budget refusal runs no turn and produces no
+                # turn-completion notification, so this event is the ONLY
+                # in-band signal that the mind is over (core.py:4308-4348).
+                if (getattr(ev, "type", None) == EventType.SESSION_TERMINATED
+                        and getattr(ev, "reason", None) == "budget_exhausted"):
+                    render_ceiling(getattr(ev, "details", None))
+                    shutdown.set()
+                    return
+
+                # A failed send is still a CALL, so the persona invariant is
+                # satisfied while nothing was delivered and nothing will wake
+                # the peer (plugin.py:1117 returns (False, receipt) for
+                # refused / sibling_cold / no_such_sibling).
+                if (getattr(ev, "type", None) == EventType.TOOL_CALL_END
+                        and getattr(ev, "tool_name", "") == "send_to_sibling"
+                        and not getattr(ev, "success", True)):
+                    await on_failed_send(ev)
+
+    async def watchdog():
+        # nonlocal: this coroutine RESETS the stall clock after nudging, and
+        # assigning it without this declaration makes it a local and shadows
+        # the one observe() maintains.
+        nonlocal last_activity
+        # Silence, not coldness, is what this watches: a loaded sibling does
+        # not rest on its own, so a quiet stream means a turn ended without
+        # a send, not a peer that unloaded.
+        while True:
+            try:
+                await asyncio.wait_for(shutdown.wait(), timeout=30.0)
+                return                  # the ceiling fired; stop nudging
+            except asyncio.TimeoutError:
+                pass
+            if time.monotonic() - last_activity > STALL_AFTER:
+                # Nudging PAST the ceiling live-locks: an exhausted session
+                # refuses every further turn (the abort rung latches the
+                # reason, jaato_session.py:8233) and each refusal emits an
+                # event that resets last_activity. Hence the shutdown gate
+                # above rather than a blind sleep (README §7.13).
+                print(f"[{_stamp()}] .. stream quiet, nudging", flush=True)
+                await client.inject_prompt(
+                    "The stream has gone quiet. Resume: send your next thought "
+                    "onward now.", source_type="user")
+                last_activity = time.monotonic()
+
+    # The one outbound call into the loop. Everything after is observation.
+    await client.send_message("Begin. Send your first thought to subconscient.")
+
+    try:
+        await asyncio.gather(observe(), watchdog())
+    except KeyboardInterrupt:
+        print(f"\n[{_stamp()}] interrupted", flush=True)
+    finally:
+        # REACHABLE, which it was not in the design's first draft: the
+        # ceiling refuses turns, it does not reap sessions, and §8.4's
+        # attachment pins the conscient in memory until someone does.
+        # UNLOAD, never delete. `delete_session` stops a half AND DESTROYS
+        # the record of what it did — the coordination example lost its
+        # coder transcripts that way, and this driver lost run 1's receipts
+        # to the same call. The transcript is the only place a
+        # send_to_sibling receipt is readable (no cascade event carries it),
+        # so deleting is deleting the evidence.
+        #
+        # Attaching away is what unloads: `attach_session` unloads the
+        # session the client LEAVES. So attach to the subconscient, then
+        # back to the conscient — that saves the subconscient — and let
+        # disconnect save the conscient on the way out.
+        print(f"[{_stamp()}] unloading both halves (saving transcripts)",
+              flush=True)
+        with contextlib.suppress(Exception):
+            await client.attach_session(sub)
+            await client.attach_session(con)   # leaving sub saves it
+        await client.disconnect()              # leaving con saves it
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass

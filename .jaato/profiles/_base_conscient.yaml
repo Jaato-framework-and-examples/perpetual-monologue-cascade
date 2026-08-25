@@ -1,0 +1,75 @@
+# Tier-1 base for the deliberate half — PROVIDER-AGNOSTIC.
+# The set file under openrouter_mixed/ binds model + provider; binding one
+# here would break set-selection.
+name: _base_conscient
+description: >
+  The deliberate half of a continuous monologue. Holds the agenda, addresses
+  the operator, does outward-facing work.
+
+  Declares NO completion_payload_schema, and that is the design. Declaring
+  one is what exposes `signal_completion` at all, so withholding it removes
+  this session's ability to exit. A perpetual monologue must not be able to
+  decide it is finished — the ceiling ends it, not the model.
+  (Borrowed from the coordination example's `_base_coder`, which learned it
+  the hard way: told to keep serving, it signalled completion on its first
+  empty turn.)
+plugins:
+  # The allow-list goes INSIDE the parentheses. `subagent[...]` with bare
+  # brackets parses as a literal plugin name and is rejected as unknown
+  # (subagent/config.py:360-400). The scope denies spawn_subagent: the
+  # halves coordinate, they do not recruit.
+  #
+  # mode:preload is not cosmetic. A discovery-gated verb costs a turn to
+  # find, and in a loop whose entire control flow IS that verb, that turn
+  # is a stall.
+  - subagent(mode:preload, tools:[list_siblings,send_to_sibling])
+  - memory
+  - todo
+gc:
+  type: hybrid
+  threshold_percent: 75.0
+  preserve_recent_turns: 6
+plugin_configs:
+  permission:
+    # `evaluators` is top-level; `defaultPolicy`/`whitelist` nest under
+    # `policy` (permission/plugin.py:387-395). Flattening them silently
+    # loses the whitelist, and turn one then blocks on an approval prompt
+    # that a headless cascade has nobody to answer (README §7.5).
+    evaluators:
+      # Registered under the TOOL NAME, never `default`:
+      # permission/plugin.py:1402-1404 skips evaluators for
+      # framework-reserved tools unless a tool-specific entry exists.
+      send_to_sibling: policies/pace_monologue.py
+    policy:
+      defaultPolicy: deny
+      whitelist:
+        tools: [send_to_sibling, list_siblings]
+
+# Read by policies/pace_monologue.py. Per-profile because the two halves
+# are paced differently and an evaluator script takes no parameters.
+env:
+  MONOLOGUE_INTERVAL_SECONDS: "30.0"
+  MONOLOGUE_THOUGHT_CEILING: "1000"
+
+# NOTE: deliberately NO budget_control — README §7.4. A profile that
+# declares its own budget is accounted separately and skipped by the
+# cascade pool, so the ceiling the driver sets on the cid would watch
+# nothing. Certified as C3, not a style preference.
+
+# Left ON, unlike the coordination example's `_base_coder`. The security
+# property in README §6 — a sibling proposes but cannot command — depends
+# on the model honouring the ⟦UNTRUSTED-EXTERNAL-CONTENT⟧ boundary its
+# inbound messages are wrapped in, and the base instructions are where
+# that boundary is explained. Their `_base_sibling-a.yaml` keeps it on for
+# exactly this reason ("C5 needs the untrusted-content boundary").
+# The cost is real and measured on their side: ~24,000 tokens of base
+# instructions per session, 81% of one coder turn's context. See RUNNING.md
+# — flipping this to true is the single biggest lever on burn rate, and
+# the trade is cost against §6.
+suppress_base_instructions: false
+
+# NOT set: max_turns. It gates the subagent loop only
+# (subagent/config.py:1068, "before the (sub)agent returns") and is inert
+# for a main session created via create_session — verified by grep: nothing
+# in jaato_session.py reads it. A perpetual session must not carry a turn
+# cap, and this one does not.

@@ -1,0 +1,18 @@
+# conscient — openrouter set. The deliberate half: slower, more capable.
+name: conscient
+inherits: [_base_conscient]
+plugins: []          # empty keeps the inherited _base surface (lists REPLACE)
+model: anthropic/claude-sonnet-5
+provider: openrouter
+plugin_configs:
+  openrouter:
+    api_key: "${JAATO_OPENROUTER_API_KEY}"
+    api_params:
+      # NOT 0.0. Every other cascade in this org pins temperature to zero
+      # because byte-identical output is the goal. Here it is the opposite:
+      # a thought process that returns the same thought forever is the
+      # failure mode (README §7.9, "a stuck volley is invisible"). This is
+      # the one knob where the monologue deliberately parts company with
+      # the determinism budget.
+      temperature: 0.8
+      max_tokens: 1200

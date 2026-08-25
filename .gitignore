@@ -1,0 +1,11 @@
+.env
+.jaato/monologue.json
+.jaato/sessions/
+.jaato/logs/
+.jaato/memory/
+.jaato/.cache/
+__pycache__/
+*.pyc
+.jaato/.artifact_tracker.json
+.jaato/todos/
+.jaato/waypoints.json

@@ -2,8 +2,9 @@
 
 **A two-sibling continuous thought loop, built from shipped jaato primitives.**
 
-Status: design sketch. Grounded in the shipped contracts (file:line references
-throughout) and **not run end to end.** The two facts it stands on are now
+Status: design sketch, now **implemented** — see [RUNNING.md](RUNNING.md) for
+the operational half and what is still missing from it. Grounded in the shipped contracts (file:line references
+throughout) and **not run end to end.** **Run end to end, twice.** The two facts it stands on are
 observed rather than read — `accepted` starts a turn (§4.1, certified), and an
 idle sibling stays loaded across a second session's creation (§11 Q2, measured)
 — both on jaato `4138a9a5`. The rest is source-reading, marked as such where it
@@ -191,7 +192,7 @@ Tier-1 base + tier-2 provider binding, per the standard profile-set layering.
 
 ```yaml
 # .jaato/profiles/_base_conscient.yaml
-name: conscient
+name: _base_conscient
 description: The deliberate half of a continuous monologue.
 plugins:
   - subagent(mode:preload, tools:[list_siblings,send_to_sibling])
@@ -203,17 +204,18 @@ gc:
   preserve_recent_turns: 6
 plugin_configs:
   permission:
-    defaultPolicy: deny
-    whitelist:
-      tools: [send_to_sibling, list_siblings]
-    evaluators:
+    evaluators:                 # top-level
       send_to_sibling: policies/pace_monologue.py
+    policy:                     # defaultPolicy/whitelist nest HERE
+      defaultPolicy: deny
+      whitelist:
+        tools: [send_to_sibling, list_siblings]
 # NOTE: deliberately NO budget_control — see §7.4
 ```
 
 ```yaml
 # .jaato/profiles/_base_subconscient.yaml
-name: subconscient
+name: _base_subconscient
 description: The associative half of a continuous monologue.
 plugins:
   - subagent(mode:preload, tools:[list_siblings,send_to_sibling])
@@ -224,23 +226,26 @@ gc:
   preserve_recent_turns: 4
 plugin_configs:
   permission:
-    defaultPolicy: deny
-    whitelist:
-      tools: [send_to_sibling, list_siblings]
-    evaluators:
+    evaluators:                 # top-level
       send_to_sibling: policies/pace_monologue.py
+    policy:                     # defaultPolicy/whitelist nest HERE
+      defaultPolicy: deny
+      whitelist:
+        tools: [send_to_sibling, list_siblings]
 ```
 
 ```yaml
 # .jaato/profiles/openrouter_mixed/conscient.yaml
-inherits: _base_conscient
+inherits: [_base_conscient]
+plugins: []          # empty keeps the inherited surface — lists REPLACE
 provider: openrouter
 model: anthropic/claude-sonnet-4.5
 ```
 
 ```yaml
 # .jaato/profiles/openrouter_mixed/subconscient.yaml
-inherits: _base_subconscient
+inherits: [_base_subconscient]
+plugins: []
 provider: openrouter
 model: anthropic/claude-haiku-4.5
 ```
@@ -338,9 +343,13 @@ chase something it is structurally blind to buys nothing.
 ### 5.3 Permissions, at the profile
 
 `plugin_configs.permission` carries the whole permission config
-(`subagent/config.py:1034`; keys in `permission/config_loader.py`:
-`defaultPolicy`, `whitelist.{tools,patterns,arguments}`, `blacklist`,
-`evaluators`). A workspace-level `permissions.json` cannot express what this
+(`subagent/config.py:1034`), and it has **two levels, not one**:
+`evaluators` sits at the top, while `defaultPolicy`, `whitelist.{tools,
+patterns,arguments}` and `blacklist` nest under `policy`
+(`permission/plugin.py:387-395`). Flattening them — which the first draft of
+this section did — silently loses the whitelist, and turn one then blocks on
+an approval prompt nobody will answer (§7.5). The working profiles in
+`jaato-cascade-coordination-example` use the nested form. A workspace-level `permissions.json` cannot express what this
 design needs, because the two halves want different pacing and different
 grants — the config has to be per-profile.
 
@@ -692,6 +701,38 @@ calls no `attach_session`, holds nothing open, and sees **both** halves — wher
 an attached client's `events()` sees only its own session. Reading is never a
 reason to stay attached.
 
+**An instrument's silence must not look like a negative result.** The rule
+this cascade cost the most to learn, and it is about tooling rather than the
+framework. `analyze_run.py` asks whether two messages drained into one turn
+were both answered — the failure that no queue metric can see, because a
+dropped message leaves a perfectly healthy-looking run. Its first detector
+counted `⟦UNTRUSTED-EXTERNAL-CONTENT⟧` wrappers per turn input. That is a
+count of SIBLING messages, not of batch size: only `deliver_sibling_message`
+wraps, while `inject_prompt_to_session` and `send_to_named_session`
+deliberately do not — an authenticated operator is not attacker-authored,
+and wrapping their words would teach the model to discount a boundary that
+exists for hostile text. So the very case most likely to occur, a sibling
+message merged with an operator nudge, showed one wrapper and scored clean.
+
+The replacement reads `DRAIN_<TIER>_MESSAGE` and
+`DRAIN_MESSAGES: Processed N messages total` (`jaato_session.py:1598,1611`),
+which see the batch AS a batch, with the tier of each message. But those go
+through `_trace` to the **provider trace file**, not the daemon log, and
+`provider_trace()` is a silent no-op unless `JAATO_PROVIDER_TRACE` names a
+path — so an unconfigured trace and a run with no merged batches produce the
+identical output: nothing. Hence `JAATO_PROVIDER_TRACE` in `.env.example`,
+and hence the analyzer reporting a missing trace **loudly** rather than
+returning zero.
+
+Neither detector was the real defect. The real defect was an instrument
+whose silence was indistinguishable from a negative result, and it survived
+two rounds of review because both rounds argued about which signal to count.
+
+If a batch ever does lose half itself, the place to fix it is
+`collected_text = "\n\n".join(collected_messages)` (`jaato_session.py:1609`)
+— the drained messages are joined with a blank line and nothing marks where
+one sender ends and the next begins.
+
 **Do not read a sibling's transcript off disk to learn what it did.**
 `.jaato/sessions/*.json` is written on SAVE, not continuously, and a session is
 saved when it unloads. The coordination example spent hours reading coder
@@ -734,7 +775,7 @@ forge (`permission/channels.py:1300`; certified as C2).
 | # | Failure | Why | Mitigation |
 |---|---|---|---|
 | 7.1 | **Loop dies silently** | Nothing enforces that a turn ends with a send. The example repo's stock personas literally end with `then stop`. | The persona invariant (§5.2), plus the driver watchdog. |
-| 7.2 | **`sibling_cold` is absorbing** | A cold peer is explicitly *not* woken by a message, so if a half is ever unloaded the loop ends permanently and quietly. **Largely retired by experiment.** A sibling does not go cold by resting or by ending a turn — cold is reached by a driver attaching away (§5.6, `c4`). The one gesture this driver makes, creating the conscient after the subconscient, was run and observed NOT to unload the idle peer (§11 Q2). What is left is the long horizon nobody has tested. | Nothing to do: the gesture was measured and is harmless. Watchdog nudge via `inject_prompt` as a backstop — heartbeat, not courier. `session.wake` revives a cold half if one ever appears, with no attachment needed. |
+| 7.2 | **`sibling_cold` is absorbing** | A cold peer is explicitly *not* woken by a message, so if a half is ever unloaded the loop ends permanently and quietly. **Retired as written, but its MITIGATION was inert.** A sibling does not go cold by resting or by ending a turn — cold is reached by a driver attaching away (§5.6, `c4`), and the one gesture this driver makes was measured harmless (§11 Q2). The danger was never coldness; it was §7.14. | Nothing to do about coldness. **But the watchdog nudge this row promised as the backstop did nothing at all** until PR #617 — see §7.14. Watchdog nudge via `inject_prompt` as a backstop — heartbeat, not courier. `session.wake` revives a cold half if one ever appears, with no attachment needed. |
 | 7.3 | **No throttle, no completion** | `accepted` starts a turn immediately; and a session's only exit is `signal_completion`, which a perpetual session never calls — so `await_completion` never fires. | Pacer evaluator (§5.4) for rate. Termination is **two parts, not one**: the ceiling only makes each session refuse further turns (latched, `jaato_session.py:8233`) and emit `SessionTerminatedEvent(reason="budget_exhausted")`; the driver observes that and calls `delete_session` (§5.6). Soft `DENY_WITH_COMMENT` wind-down first, then the hard clamp, then the reap. |
 | 7.4 | **The budget hole** | A profile declaring its own `budget_control` is accounted separately and **skipped by the cascade pool** — with both profiles declaring one, the ceiling watches nothing. | Neither sibling profile may declare `budget_control`. This is certified as C3, not a style preference. |
 | 7.5 | **Permission stall** | `send_to_sibling` is permission-gated; a headless loop has nobody to answer the prompt. | Profile-level whitelist (§5.3). Note evaluators still run over it. |
@@ -746,8 +787,9 @@ forge (`permission/channels.py:1300`; certified as C2).
 | 7.11 | **Whisper starvation** | An idle-only stamp drains only when the session is idle, and a hot volley leaves little idle time. | Accepted rather than fixed: freedom to ignore implies no timeliness guarantee. Escalate to `speak` (`user`, high priority) when it actually matters. |
 | 7.12 | **A failed send still satisfies the invariant** | The persona rule is "never end a turn without *calling* `send_to_sibling`" — but a call is not a delivery. `refused`, `sibling_cold` and `no_such_sibling` all return `(False, receipt)`, a hard tool error that delivered nothing (`plugin.py:1117`), and nothing then wakes the peer. `refused` is the least expected of the three: `SIBLING_PENDING_CAP = 20` consecutive `queued` sends to a peer that never came up for air (`session_manager.py:360,5304`). | Driver-side branch on `ToolCallEndEvent(tool_name="send_to_sibling", success=False)` (§5.6) — driver-side and **not** in the persona, for the reasons in §5.2. **Partial.** The event carries the receipt's prose, not its `status`, so the driver matches on a sentence. And `refused` is *backpressure, not a fault* — the caps are "in front of that ceiling, not a replacement for it" (`session_manager.py:353`) and the refusal literally says "Let it work" — so it is deliberately not treated as an error. The counter also resets on any delivery finding the peer idle, which makes a strictly alternating pair near-immune and a third sibling (§11 Q6) not. |
 | 7.13 | **The ceiling leaks the cascade** | A budget refusal terminates nothing (§5.6). With `observe()` and `watchdog()` both looping forever, `gather` never returns, the `finally` that reaps both sessions is unreachable, and §8.4's attachment pins the conscient in memory indefinitely. The watchdog then live-locks: nudge at `STALL_AFTER` → the exhausted session refuses → the refusal emits an event → `last_activity` resets → nudge again, forever, in a process that can no longer do anything. | A `shutdown` event set from `SessionTerminatedEvent(reason="budget_exhausted")`, a watchdog that awaits it instead of sleeping blind, and `aclosing()` on the iterator (§5.6). |
-| 7.14 | **A refused spawn is silent, and silence looks like work** | `cascade_budget_set` runs before the sessions are created, so a cid with no headroom refuses the spawn — correctly. But the refusal is logged daemon-side (`cascade refused spawn of <id>: reason='cascade_budget_exhausted', exhausted_dimensions=['tokens']`) and is **silent from the client side**: it is indistinguishable from a slow turn. The coordination example's driver hung fifteen minutes on exactly this. A shutdown path waiting on a terminate event compounds it — no session was ever created, so no event will ever come. | Call `cascade_budget_get` before drawing any conclusion from silence, and treat `create_session`'s timeout as a real branch rather than an error path. Reported from their run, not designed for here — this driver has not been run. |
-| 7.15 | **The shutdown path is the least-tested code in the design** | It runs once, at the end, when nobody is watching, and every claim under it — that `SessionTerminatedEvent(reason="budget_exhausted")` reaches a `cascade_events(role="owner")` subscriber at all, that `details` carries per-dimension usage — is read from `core.py:4308-4348` and **has never been observed**. The coordination example has hit a cascade ceiling, but only as a refused *spawn* (§7.14), which is a different event; it has never seen this one on an owner's stream. | None yet. Deliberately not mitigated by guesswork: the honest state is unverified, and the test costs real money, so it is recorded rather than papered over. |
+| 7.14 | **A message delivered to a session with no drainer is stranded forever** | **The one that actually kills this design, observed twice and confirmed by the framework owner as a real bug (fixed in PR #617).** Two faces, one cause. (a) `send_to_sibling` to a peer the daemon still considers busy takes the QUEUE branch — but `_drain_child_messages` was the last statement of `_run_chat_loop`, and daemon-side `_model_running` clears five steps later, so a send landing in that window queued onto a tier whose drainer had already gone past and whose continuation callback was already torn down. Nothing could ever pop it. (b) `inject_prompt` starts a turn only while `_on_continuation_needed` is installed — for the DURATION of a `send_message` RPC, not whenever a session is idle — so the §7.2 watchdog nudge was a **no-op**. Both watchdog firings in run 7 did nothing. | **Framework fix, not a workaround.** #617 loops the drain until the queue is empty and lets that re-check end the turn, so a late message is either drained or arrives after the busy flag clears (and the sender then DRIVES, per #612); exactly one continuation fires per batch, because firing per pass would turn one stranded message into duplicate turns — worse for a loop with no driver. `inject_prompt_to_session` now drives an idle target, fixed in the shared primitive because reactor rules and webhook handlers had the same hole. **This design does not work on a framework older than #617.** |
+| 7.15 | **A live session's transcript cannot be read** | A `send_to_sibling` receipt is readable in exactly one place — the sending session's saved history. No cascade event carries the body, and `ToolCallEndEvent.success` is True for both `accepted` and `queued`, so the driver cannot tell them apart live. History is written on SAVE, and a session under diagnosis has not saved. Forcing it by attaching away is a side effect standing in for an interface, and a silent no-op when the client is attached elsewhere — which is what happened here: the subconscient's file stayed pinned at the instant it sent, so its receipt was never obtainable. | `session.save [id]` shipped in #617; `SessionManager.save_session` had always existed with nothing exposing it. Until then the receipt is only the model's word for it. |
+| 7.16 | **A refused spawn is silent, and silence looks like work** | `cascade_budget_set` runs before the sessions are created, so a cid with no headroom refuses the spawn — correctly — but the refusal is logged daemon-side and is invisible to the client, indistinguishable from a slow turn. The coordination example's driver hung fifteen minutes on it. | Call `cascade_budget_get` before drawing any conclusion from silence. Reported from their run; not hit here. |
 
 ---
 
