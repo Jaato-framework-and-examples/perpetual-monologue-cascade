@@ -94,6 +94,9 @@ def _stamp():
 #: shape of a thought. Buffer per agent, flush when that agent stops.
 _buf = {}
 
+#: session_ids whose history should be flushed at the next safe point.
+_pending_saves = []
+
 
 def _flush(who):
     text = "".join(_buf.pop(who, [])).strip()
@@ -117,6 +120,15 @@ def render(ev):
         _flush(who)
         ok = "→" if getattr(ev, "success", False) else "✗"
         print(f"[{_stamp()}] {who} {ok} send_to_sibling", flush=True)
+        # The receipt is readable ONLY in the sending session's saved
+        # history, and history is written on SAVE. Runs 6-8 lost every
+        # subconscient receipt this way. `session.save` (#617) is the
+        # supported flush; attaching away is not — on an already-cold
+        # session it restores the STALE file and writes it back, so it
+        # round-trips old data over new.
+        sid = getattr(ev, "session_id", None)
+        if sid:
+            _pending_saves.append(sid)
     elif kind == EventType.AGENT_STATUS_CHANGED and getattr(ev, "status", "") == "done":
         _flush(who)
 
@@ -224,6 +236,10 @@ async def main():
                                       role="owner")) as stream:
             async for ev in stream:
                 render(ev)
+                while _pending_saves:
+                    with contextlib.suppress(Exception):
+                        await client.execute_command(
+                            "session.save", args=[_pending_saves.pop(0)])
                 # Only a THOUGHT resets the stall clock. Keying on any event
                 # made the watchdog useless in run 1: the cascade stream
                 # emits status/telemetry events continuously, so a mind that
@@ -241,6 +257,24 @@ async def main():
                 if (getattr(ev, "type", None) == EventType.SESSION_TERMINATED
                         and getattr(ev, "reason", None) == "budget_exhausted"):
                     render_ceiling(getattr(ev, "details", None))
+                    shutdown.set()
+                    return
+
+                # THE OTHER WAY THE CEILING ARRIVES (#611, a49e6adf).
+                # A budget-refused SPAWN used to reach only the requesting
+                # client, so a driver watching the cid saw a session that
+                # never appeared and no reason — indistinguishable from a
+                # hang (§7.16). It now dispatches to cascade observers with
+                # structured evidence, so "the budget did its job" and
+                # "something broke" stop looking the same.
+                if (getattr(ev, "type", None) == EventType.ERROR
+                        and getattr(ev, "error_type", "") == "CascadeExhaustedError"):
+                    d = getattr(ev, "details", None) or {}
+                    print(f"\n[{_stamp()}] ── ceiling refused a spawn ──\n"
+                          f"  exhausted: {d.get('exhausted_dimensions')}\n"
+                          f"  remaining: {d.get('cascade_remaining')}\n"
+                          f"  session:   {getattr(ev, 'session_id', None)}",
+                          flush=True)
                     shutdown.set()
                     return
 

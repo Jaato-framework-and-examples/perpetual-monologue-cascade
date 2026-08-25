@@ -34,6 +34,21 @@ DRAIN_ONE = re.compile(
     r"DRAIN_(?P<tier>\w+)_MESSAGE: agent_id=(?P<agent>[^,]*), "
     r"source_type=(?P<src>[^,]*), source_id=(?P<sid>[^,]*)")
 
+#: #618. Daemon log, greppable with nothing configured — deliberately, so
+#: the diagnostic is readable during the run it is needed for rather than
+#: after it.
+SIBLING_DELIVERY = re.compile(
+    r"SIBLING_DELIVERY: from=(?P<frm>\S+) to=(?P<to>\S+) "
+    r"target_session=(?P<sess>\S+) busy=(?P<busy>\S+) "
+    r"thread_alive=(?P<alive>\S+) outcome=(?P<outcome>\S+)")
+
+#: #618. The half neither instrument could see: whether a drain pass ran at
+#: all, and what it found.
+DRAIN_SUMMARY = re.compile(
+    r"DRAIN_SUMMARY: agent_id=(?P<agent>\S+) queue_at_entry=(?P<entry>\d+) "
+    r"drained=(?P<drained>\d+) passes=(?P<passes>\d+) "
+    r"queue_at_exit=(?P<exit>\d+)")
+
 #: Batch size, emitted once per drain. `jaato_session.py:1611`.
 DRAIN_TOTAL = re.compile(r"DRAIN_MESSAGES: Processed (?P<n>\d+) messages total")
 
@@ -91,7 +106,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("cascade", nargs="?")
     ap.add_argument("--log", default="/tmp/mono.log")
-    ap.add_argument("--trace", default="/tmp/mono-trace.log",
+    ap.add_argument("--trace", default="/tmp/mono-trace",
                     help="provider trace base path (JAATO_PROVIDER_TRACE); "
                          "per-agent variants are globbed")
     args = ap.parse_args()
@@ -102,6 +117,50 @@ def main():
         return 1
     cid = docs[0].get("cascade_driver_id")
     print(f"cascade {cid[:12]}  ({len(docs)} sessions)\n")
+
+    # ---- 0. #618: the send, and whether a drain ever ran ----------------
+    deliveries, drains = [], []
+    if os.path.isfile(args.log):
+        with open(args.log, errors="replace") as fh:
+            for ln in fh:
+                if "RPC_DIAG" in ln:
+                    continue
+                d = SIBLING_DELIVERY.search(ln)
+                if d:
+                    deliveries.append(d.groupdict())
+                k = DRAIN_SUMMARY.search(ln)
+                if k:
+                    drains.append(k.groupdict())
+
+    print("== 0. delivery + drain (#618) ==")
+    if not deliveries and not drains:
+        print("  neither token present — pre-#618 daemon, or no sibling "
+              "traffic. NOT evidence of anything.")
+    for d in deliveries:
+        # busy=True alive=True  -> peer genuinely mid-turn (a sleeping
+        #                          evaluator counts, and is honest)
+        # busy=True alive=False -> the flag outlived its thread
+        note = ""
+        if d["busy"] == "True":
+            note = ("  peer mid-turn (honest)" if d["alive"] == "True"
+                    else "  <-- STALE FLAG: busy with no live thread")
+        print(f"  send {d['frm']}->{d['to']}: outcome={d['outcome']} "
+              f"busy={d['busy']} thread_alive={d['alive']}{note}")
+    for k in drains:
+        entry, drained = int(k["entry"]), int(k["drained"])
+        if entry == 0:
+            verdict = "  <-- ran, queue EMPTY: message is not on the queue " \
+                      "the drain reads (or never arrived)"
+        elif drained == 0:
+            verdict = "  <-- ran, SAW it, did not take it"
+        else:
+            verdict = "  collected"
+        print(f"  drain {k['agent']}: entry={entry} drained={drained} "
+              f"passes={k['passes']} exit={k['exit']}{verdict}")
+    if deliveries and not drains:
+        print("  !! a send was recorded but NO drain summary — the drain did "
+              "not run on that turn")
+    print()
 
     # ---- 2. turns per message, and 3. accepted-with-no-turn -------------
     sent_to, turns_of = {}, {}
@@ -176,6 +235,36 @@ def main():
             hits = [ln.strip() for ln in fh if BOUND_WARN.search(ln)]
     print("  " + ("\n  ".join(hits) if hits
                   else f"clean (no bound warning in {args.log})"))
+
+    # ---- 4b. how the run ENDED -----------------------------------------
+    #
+    # Without this a clean budget stop and a stall look identical in the
+    # transcripts — the exact confusion that cost two runs today.
+    print("\n== 4b. terminal condition ==")
+    marks = []
+    if os.path.isfile(args.log):
+        with open(args.log, errors="replace") as fh:
+            for ln in fh:
+                # NOT a bare "budget_exhausted" substring: that also
+                # matches the `session.get_budget_exhausted` RPC, which is
+                # a POLL and says nothing about whether the ceiling fired.
+                # Matching it reported "the budget did its job" for a run
+                # that had been killed by hand — a confident wrong answer
+                # from the instrument, which is worse than no answer.
+                if "RPC_DIAG" in ln:
+                    continue
+                if ("cascade_budget_exhausted" in ln
+                        or "CascadeExhaustedError" in ln
+                        or "stopped at its budget ceiling" in ln
+                        or 'reason="budget_exhausted"' in ln):
+                    marks.append(ln.strip()[:160])
+    if marks:
+        print("  ceiling stopped it (budget did its job):")
+        for m in marks[-3:]:
+            print(f"    {m}")
+    else:
+        print("  no budget-exhaustion marker — the run ended some other way "
+              "(stall, kill, or still running). NOT a clean stop.")
 
     # ---- 5. the genuine unknown: slow asymmetry over rounds -------------
     print("\n== 5. asymmetry over rounds (nobody has seen past round 1) ==")

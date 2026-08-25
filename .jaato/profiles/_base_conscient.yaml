@@ -48,6 +48,11 @@ plugin_configs:
 # Read by policies/pace_monologue.py. Per-profile because the two halves
 # are paced differently and an evaluator script takes no parameters.
 env:
+  # PER-HALF trace path. Both runners writing one file interleaves their
+  # lines, which makes every claim drawn from it carry an
+  # "I cannot rule out interleaving" caveat. Set here rather than in .env
+  # because profile env is the only layer that can differ per session.
+  JAATO_PROVIDER_TRACE: "/tmp/mono-trace-conscient.log"
   MONOLOGUE_INTERVAL_SECONDS: "30.0"
   MONOLOGUE_THOUGHT_CEILING: "1000"
 
