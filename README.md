@@ -3,7 +3,12 @@
 **A two-sibling continuous thought loop, built from shipped jaato primitives.**
 
 Status: design sketch. Grounded in the shipped contracts (file:line references
-throughout), but not yet run end to end.
+throughout) and **not run end to end.** The two facts it stands on are now
+observed rather than read — `accepted` starts a turn (§4.1, certified), and an
+idle sibling stays loaded across a second session's creation (§11 Q2, measured)
+— both on jaato `4138a9a5`. The rest is source-reading, marked as such where it
+is load-bearing (§5.4, §7.15). Framework provenance for every claim below:
+`4138a9a5`.
 Origin: comparison of [laude-institute/headlong](https://github.com/laude-institute/headlong)'s
 `philosophy.md` against `docs/design-philosophy.md`.
 
@@ -119,13 +124,35 @@ loop except a nudge when the loop has stalled.
 → turn on B → B → (idle) A → turn on A → …, indefinitely, with no external
 driver.
 
-> **Documentation drift, worth knowing.** The example repo's `SURFACE.md` §2.2
-> specifies a `wake` parameter defaulting to `false`, arguing that waking a
-> sibling makes every session "a cost centre that any other sibling can start."
-> **That parameter did not ship.** The shipped schema has only `sibling_name`
-> and `message`. Trust `plugin.py:1012` over `SURFACE.md` here — and note the
-> concern §2.2 raised is real and lands squarely on this design, which is why
-> §7 and §8 exist.
+> **Provenance: verified on current main.** `accepted` → a turn really runs is
+> observed, not read. `certify/c4_cold_sibling_is_queued.py` passes on jaato
+> `4138a9a5`, *after* `#612` (`93d19cc9`) rewrote the queue-or-drive decision
+> for every sender — the exact path this depends on. Verbatim:
+>
+> ```
+> idle    {'status': 'accepted', 'sibling_name': 'awake', 'bytes': 5}
+>         took_a_turn=True
+> cold    {'status': 'sibling_cold', 'error': "... is resting (unloaded).
+>          Cold siblings are not woken by a sibling message."}   woken=False
+> deleted {'status': 'no_such_sibling', 'error': "no sibling named 'gone' ..."}
+> ```
+>
+> And the assertion genuinely covers it rather than assuming it: C4a fails if
+> `accepted` is returned with no turn started on the peer's own session —
+> *"accepted must mean a turn began, not merely that the message was taken."*
+>
+> **Receipt shape**, since it changed: `{status, sibling_name, bytes}` on
+> success; error branches carry `{status, error}` and **no** `sibling_name`.
+> `#612` deleted `delivered` — that word is gone from the vocabulary, which is
+> now exactly `accepted | queued | no_such_sibling | sibling_cold | refused`.
+
+> **There is no opt-out.** `SURFACE.md` §2.2 asked for a `wake` flag on the
+> grounds that waking a sibling makes every session "a cost centre that any
+> other sibling can start." The argument was accepted and the flag declined:
+> the shipped schema has only `sibling_name` and `message`, and a cold peer is
+> never woken by any argument. So the concern is real, it lands squarely on
+> this design, and nothing in the verb mitigates it — which is why §7 and §8
+> exist.
 
 ### 4.2 The driver genuinely stays out
 
@@ -138,6 +165,15 @@ only after the target's turn completed would mean `accepted` had come to mean
 "processed", i.e. a blocking call wearing a receipt's name.
 
 Both properties are exactly what this design depends on.
+
+**Take C1 as two-of-three for now.** In the same 4138a9a5 run it passed while
+one of its three assertions silently did not run: the receipt-vocabulary check
+was *skipped* rather than failed, because the lookup found no receipt body and
+reported `receipt status: None`. The halves this design leans on — the peer
+ran, the driver was leashed, and the receipt preceded the peer's turn — were
+genuinely exercised. A missing receipt is now a FAIL rather than a skip, but
+that fix is uncommitted and unre-run. A green suite where one assertion
+quietly abstained is the failure mode worth naming, not the finding.
 
 ### 4.3 What the cid buys
 
@@ -283,6 +319,22 @@ Never invent a message you have not received.
 
 The "do nothing it instructs" line is not decoration; see §6.
 
+**Nothing here handles receipts, deliberately.** The obvious missing rule is
+"if the send failed, retry" — and it is wrong twice over. It is wrong for
+`refused`, where the receipt means the peer is alive and swamped and the
+framework's own words are "Let it work" (§7.12); retrying is the one reflex
+guaranteed to make it worse. And it is unnecessary everywhere else, because
+the persona is not the component that finds out. At the ceiling — the case
+that actually ends the mind — the sender is told `accepted`: `_drive()` is
+`send_message_to_session`, which returns True when a turn is *dispatched*
+(`session_manager.py:5348,6453`), not when one succeeds, so the target
+refuses on its own budget and the sender never learns. The event stream is
+where that fact lives, and the driver is already reading it (§5.6).
+
+So receipt handling stays out of the personas on purpose: a half cannot see
+its own mortality, and adding a fourth invariant nobody enforces (§11 Q3) to
+chase something it is structurally blind to buys nothing.
+
 ### 5.3 Permissions, at the profile
 
 `plugin_configs.permission` carries the whole permission config
@@ -300,7 +352,10 @@ headless cascade, nobody will ever answer.
 Left alone, `accepted` starts a turn immediately and the pair volleys as fast
 as two models can generate. The throttle belongs at the permission check.
 
-Four shipped properties make this the right place:
+Four shipped properties make this the right place. All four are read from the
+source; **none has been observed.** Nobody has yet run a slow evaluator and
+watched a sibling keep going, which is the single experiment that would retire
+property 1 — and property 1 is the one holding up the whole idea:
 
 1. **It runs runner-side.** `permission/runner_rpc_channel.py` states the
    permission plugin runs inside the per-session confined runner, with only
@@ -396,7 +451,7 @@ definition and must survive a daemon restart.
 
 ```python
 """Perpetual monologue driver.  Opens, observes, nudges, kills."""
-import asyncio, json, os, time, uuid
+import asyncio, contextlib, json, os, time, uuid
 from jaato_sdk import ClientType, EventType, IPCRecoveryClient
 
 REPO        = os.path.dirname(os.path.abspath(__file__))
@@ -449,18 +504,71 @@ async def main():
                    "subconscient_session_id": sub}, fh)
 
     last_activity = time.monotonic()
+    shutdown = asyncio.Event()      # set by the ceiling; awaited by both tasks
+
+    async def on_failed_send(ev):
+        # The receipt STATUS is not on the event — only the prose the
+        # receipt's `error` key carried (jaato_session.py:6311). So this
+        # matches a sentence, which is brittle; see §7.12.
+        msg = ev.error_message or ""
+        if "is resting (unloaded)" in msg:
+            # sibling_cold. NOT expected in a running loop: cold is reached
+            # by a driver attaching away, not by resting (§5.6 note). If it
+            # fires, the driver put it there — revive with `session.wake`
+            # (§11 Q2), which needs no attachment.
+            render_cold(ev)
+        elif "has not been idle since" in msg:
+            render_backpressure(ev)     # peer alive and busy; "Let it work."
+        else:
+            shutdown.set()              # no_such_sibling: unrecoverable
 
     async def observe():
         nonlocal last_activity
-        async for ev in client.cascade_events(cid, event_types=None, role="owner"):
-            last_activity = time.monotonic()
-            render(ev)                      # your renderer; see §9
+        # aclosing(): `async for ... break` does NOT run the iterator's
+        # finally, so cascade.unregister would wait for GC or the 50ms
+        # disconnect backstop (ipc.py:2291, "Cleanup contract").
+        async with contextlib.aclosing(
+                client.cascade_events(cid, event_types=None,
+                                      role="owner")) as stream:
+            async for ev in stream:
+                last_activity = time.monotonic()
+                render(ev)                  # your renderer; see §9
+
+                # THE CEILING. A budget refusal runs no turn and produces no
+                # turn-completion notification, so this event is the ONLY
+                # in-band signal that the mind is over (core.py:4308-4348).
+                # details = {"reason": <prose>, "usage": {<per-dimension>}}.
+                if (ev.type == EventType.SESSION_TERMINATED
+                        and ev.reason == "budget_exhausted"):
+                    render_ceiling(ev.details)
+                    shutdown.set()
+                    return
+
+                # A failed send is still a CALL, so the persona invariant is
+                # satisfied while nothing was delivered and nothing will wake
+                # the peer (plugin.py:1117 returns (False, receipt) for
+                # refused / sibling_cold / no_such_sibling).
+                if (ev.type == EventType.TOOL_CALL_END
+                        and ev.tool_name == "send_to_sibling"
+                        and not ev.success):
+                    await on_failed_send(ev)
 
     async def watchdog():
-        # The loop's only structural weakness: sibling_cold is absorbing.
+        # Silence, not coldness, is what this watches: a loaded sibling does
+        # not rest on its own (§5.6 note), so a quiet stream means a turn
+        # ended without a send, not a peer that unloaded.
         while True:
-            await asyncio.sleep(30.0)
+            try:
+                await asyncio.wait_for(shutdown.wait(), timeout=30.0)
+                return                  # the ceiling fired; stop nudging
+            except asyncio.TimeoutError:
+                pass
             if time.monotonic() - last_activity > STALL_AFTER:
+                # Nudging PAST the ceiling live-locks: an exhausted session
+                # refuses every further turn (the abort rung latches the
+                # reason, jaato_session.py:8233) and each refusal emits an
+                # event that resets last_activity. Hence the shutdown gate
+                # above rather than a blind sleep (§7.13).
                 await client.inject_prompt(
                     "The stream has gone quiet. Resume: send your next thought "
                     "onward now.", source_type="user")
@@ -471,6 +579,9 @@ async def main():
     try:
         await asyncio.gather(observe(), watchdog())
     finally:
+        # REACHABLE, which it was not before: the ceiling refuses turns, it
+        # does not reap sessions, and §8.4's attachment pins the conscient
+        # in memory until someone does (§7.3, §7.13).
         await client.delete_session(con)
         await client.delete_session(sub)
         await client.disconnect()
@@ -485,6 +596,91 @@ asyncio.run(main())
 ladder grammar as a profile's `budget_control`, so the cascade can step down to
 a cheaper model as headroom shrinks rather than stopping dead.
 
+**The ceiling does not reap.** *Read from the source, never observed — the one
+load-bearing claim in this document with no run behind it (§7.15).* Worth
+stating because the shape is not obvious:
+exhaustion makes a session *refuse further turns*, and the abort rung latches
+that refusal precisely so it survives the turn that triggered it — *"a ceiling
+that only cancels one turn is not a ceiling"* (`jaato_session.py:8225-8235`).
+The sessions stay alive, addressable and (for the conscient) attached. Reaping
+is the driver's job, and the signal it reaps on is
+`SessionTerminatedEvent(reason="budget_exhausted")`, which exists for exactly
+this reader: a refusal short-circuits before any turn runs, so no
+turn-completion notification fires and a driver waiting on one *"waited out its
+full timeout and reported a generic failure, making a correct ceiling stop
+indistinguishable from a break"* (`core.py:4308-4348`). Its `details` carries
+the refusal prose and per-dimension usage, so the driver branches on structure
+rather than parsing the output stream (`events.py:571-577`).
+
+It is a `SessionTerminatedEvent` rather than an `ErrorEvent` on purpose —
+filing a working ceiling as a failure would mischaracterise it. The spawn-time
+refusal is the one that *is* an error: `CascadeBudgetExhausted.as_payload()`
+rides an `ErrorEvent.details` with `exhausted_dimensions`, `effective`,
+`profile_limits`, `cascade_remaining` and `clamped`
+(`budget_control.py:138-156`) — that is the cid-with-no-headroom case §5.6's
+ordering comment refers to.
+
+Note the ceiling fires **per session**, not per cascade: whichever half runs
+the next turn refuses, and the other half is never terminated at all — it is
+simply never woken again, its only wake source having been the half that just
+died. So one event is the whole notice you get, and both sessions still need
+deleting.
+
+**Creation order is the one place this driver can put a sibling to sleep.**
+A session does not go cold by resting. `certify/c4_cold_sibling_is_queued.py`
+states it outright — *"COLD IS REACHED BY ATTACHING AWAY, not by waiting"* —
+and records an earlier version of that very test making the opposite
+assumption: it created a session, never prompted it, called it cold, and was
+answered `accepted`, because the driver was still attached and the session was
+idle-**loaded**. *"The receipt was right and the test was wrong."*
+`examples/chapter_cascade.py` corroborates from the other side: unloading its
+coder takes a deliberate two-step attach dance, commented *"TWO steps, and
+both are needed"* — which would be pointless if a sibling rested on its own.
+
+The gesture that unloads is therefore `attach_session` **leaving** a session,
+and this driver performs it once: creating the conscient attaches the driver
+to it, which is an attach-away from the subconscient created a moment earlier.
+`_maybe_unload_session` defers while the model is running
+(`session_manager.py:8484`), so whether it fires depends on whether the
+subconscient is mid-turn at that instant.
+
+**Settled by experiment: the gesture does not unload it, and the order above
+is safe as written.** A run built for this question — framework `4138a9a5`,
+sibling A created and its turn allowed to *complete* before B was created, so
+A was genuinely idle rather than mid-brief:
+
+```
+20:42:49  A created, driver attached to A
+20:43:13  A's turn COMPLETED — idle from here, nothing driving it
+20:43:33  B created  <- the attach-away from A
+20:47:15  B's send to A: {'status': 'accepted', 'sibling_name': 'alpha', 'bytes': 4}
+
+A's entire lifecycle in the daemon log:
+  20:42:49  created and context set
+  20:47:05  Client ipc_7 attached to session 20260825_204241   <- forced save
+  20:47:16  Unloaded session: 20260825_204241
+```
+
+`accepted` says A was still loaded. And it is **"never unloaded"** rather than
+"unloaded, then revived by the delivery" — the two that the receipt alone
+cannot distinguish: there is no `"Unloaded session"` line for A anywhere
+between B's creation and the send. The only unload comes four minutes *later*
+and is caused by the observer's own forced-save attach, not by the loop.
+
+The side fact is the more useful one: **A sat idle for four minutes, with a
+completed turn behind it, across a second session's creation, and did not
+unload.** Together with 124 unload lines of which none mentions idle, timeout,
+or orphan, that is as close to "a loaded sibling does not rest on its own" as
+observation gets. Not proof of no-timeout-ever — four minutes is not an hour,
+and no run has looked at a longer horizon.
+
+Worth borrowing their hard-won correction rather than repeating it: a
+`"triggered unload"` line 43 seconds after a session was created looked like
+an idle timer, complete with a number and a plausible mechanism. It fires
+after `SessionTerminatedEvent`, not on a clock; the 43 seconds was how long
+that session took to crash. **A timer that does not exist is hard to retract,
+because the number looks like evidence.**
+
 ### 5.7 Observability
 
 The driver registers with `role="owner"` (single per cid, lifecycle authority);
@@ -495,6 +691,14 @@ This is the cascade-client registry, **not** session attachment. An observer
 calls no `attach_session`, holds nothing open, and sees **both** halves — where
 an attached client's `events()` sees only its own session. Reading is never a
 reason to stay attached.
+
+**Do not read a sibling's transcript off disk to learn what it did.**
+`.jaato/sessions/*.json` is written on SAVE, not continuously, and a session is
+saved when it unloads. The coordination example spent hours reading coder
+transcripts that showed `turns=0` for a session that had run — stale snapshots
+taken at creation, because the driver attached straight to the session that was
+already current and so left nothing behind to save. The event stream is the
+live view; the file is a snapshot of the last save.
 
 `examples/render_cascade.py` in the example repo already renders every session
 of one cascade as a single document — prose, tool calls with arguments,
@@ -530,8 +734,8 @@ forge (`permission/channels.py:1300`; certified as C2).
 | # | Failure | Why | Mitigation |
 |---|---|---|---|
 | 7.1 | **Loop dies silently** | Nothing enforces that a turn ends with a send. The example repo's stock personas literally end with `then stop`. | The persona invariant (§5.2), plus the driver watchdog. |
-| 7.2 | **`sibling_cold` is absorbing** | A peer that ORPHANs out and unloads is explicitly *not* woken by a message. One dropped volley ends the mind permanently and quietly. | Watchdog nudge via `inject_prompt` — heartbeat, not courier, so the driver stays out of the loop. The driver's attachment also pins the conscient (§8.4), leaving only the subconscient exposed to this. |
-| 7.3 | **No throttle, no completion** | `accepted` starts a turn immediately; and a session's only exit is `signal_completion`, which a perpetual session never calls — so `await_completion` never fires. | Pacer evaluator (§5.4) for rate; `cascade_budget_set` + `delete_session` for termination. Two-tier: soft `DENY_WITH_COMMENT` wind-down, then the hard cascade clamp. |
+| 7.2 | **`sibling_cold` is absorbing** | A cold peer is explicitly *not* woken by a message, so if a half is ever unloaded the loop ends permanently and quietly. **Largely retired by experiment.** A sibling does not go cold by resting or by ending a turn — cold is reached by a driver attaching away (§5.6, `c4`). The one gesture this driver makes, creating the conscient after the subconscient, was run and observed NOT to unload the idle peer (§11 Q2). What is left is the long horizon nobody has tested. | Nothing to do: the gesture was measured and is harmless. Watchdog nudge via `inject_prompt` as a backstop — heartbeat, not courier. `session.wake` revives a cold half if one ever appears, with no attachment needed. |
+| 7.3 | **No throttle, no completion** | `accepted` starts a turn immediately; and a session's only exit is `signal_completion`, which a perpetual session never calls — so `await_completion` never fires. | Pacer evaluator (§5.4) for rate. Termination is **two parts, not one**: the ceiling only makes each session refuse further turns (latched, `jaato_session.py:8233`) and emit `SessionTerminatedEvent(reason="budget_exhausted")`; the driver observes that and calls `delete_session` (§5.6). Soft `DENY_WITH_COMMENT` wind-down first, then the hard clamp, then the reap. |
 | 7.4 | **The budget hole** | A profile declaring its own `budget_control` is accounted separately and **skipped by the cascade pool** — with both profiles declaring one, the ceiling watches nothing. | Neither sibling profile may declare `budget_control`. This is certified as C3, not a style preference. |
 | 7.5 | **Permission stall** | `send_to_sibling` is permission-gated; a headless loop has nobody to answer the prompt. | Profile-level whitelist (§5.3). Note evaluators still run over it. |
 | 7.6 | **Context overflow** | Monotonic growth with no human pausing to reset. | `gc_hybrid` on both halves, thresholds below default (§5.5). |
@@ -540,6 +744,10 @@ forge (`permission/channels.py:1300`; certified as C2).
 | 7.9 | **A stuck volley is invisible** | Two halves can loop on the same thought indefinitely and every event looks healthy. | Renderer + a driver-side check on repetition; unsolved below. |
 | 7.10 | **A whisper unloads the mind** | The transient whisper is safe *only* because the driver holds the conscient attached. With the driver detached — mid-reconnect after a daemon restart — a whisper is briefly the only client, and its disconnect can unload the conscient into `cold`. | The driver's recovery path must re-attach before resuming anything else. Until it has, whispers are unsafe; the whisper client should refuse to run if `monologue.json` is older than the daemon's start. |
 | 7.11 | **Whisper starvation** | An idle-only stamp drains only when the session is idle, and a hot volley leaves little idle time. | Accepted rather than fixed: freedom to ignore implies no timeliness guarantee. Escalate to `speak` (`user`, high priority) when it actually matters. |
+| 7.12 | **A failed send still satisfies the invariant** | The persona rule is "never end a turn without *calling* `send_to_sibling`" — but a call is not a delivery. `refused`, `sibling_cold` and `no_such_sibling` all return `(False, receipt)`, a hard tool error that delivered nothing (`plugin.py:1117`), and nothing then wakes the peer. `refused` is the least expected of the three: `SIBLING_PENDING_CAP = 20` consecutive `queued` sends to a peer that never came up for air (`session_manager.py:360,5304`). | Driver-side branch on `ToolCallEndEvent(tool_name="send_to_sibling", success=False)` (§5.6) — driver-side and **not** in the persona, for the reasons in §5.2. **Partial.** The event carries the receipt's prose, not its `status`, so the driver matches on a sentence. And `refused` is *backpressure, not a fault* — the caps are "in front of that ceiling, not a replacement for it" (`session_manager.py:353`) and the refusal literally says "Let it work" — so it is deliberately not treated as an error. The counter also resets on any delivery finding the peer idle, which makes a strictly alternating pair near-immune and a third sibling (§11 Q6) not. |
+| 7.13 | **The ceiling leaks the cascade** | A budget refusal terminates nothing (§5.6). With `observe()` and `watchdog()` both looping forever, `gather` never returns, the `finally` that reaps both sessions is unreachable, and §8.4's attachment pins the conscient in memory indefinitely. The watchdog then live-locks: nudge at `STALL_AFTER` → the exhausted session refuses → the refusal emits an event → `last_activity` resets → nudge again, forever, in a process that can no longer do anything. | A `shutdown` event set from `SessionTerminatedEvent(reason="budget_exhausted")`, a watchdog that awaits it instead of sleeping blind, and `aclosing()` on the iterator (§5.6). |
+| 7.14 | **A refused spawn is silent, and silence looks like work** | `cascade_budget_set` runs before the sessions are created, so a cid with no headroom refuses the spawn — correctly. But the refusal is logged daemon-side (`cascade refused spawn of <id>: reason='cascade_budget_exhausted', exhausted_dimensions=['tokens']`) and is **silent from the client side**: it is indistinguishable from a slow turn. The coordination example's driver hung fifteen minutes on exactly this. A shutdown path waiting on a terminate event compounds it — no session was ever created, so no event will ever come. | Call `cascade_budget_get` before drawing any conclusion from silence, and treat `create_session`'s timeout as a real branch rather than an error path. Reported from their run, not designed for here — this driver has not been run. |
+| 7.15 | **The shutdown path is the least-tested code in the design** | It runs once, at the end, when nobody is watching, and every claim under it — that `SessionTerminatedEvent(reason="budget_exhausted")` reaches a `cascade_events(role="owner")` subscriber at all, that `details` carries per-dimension usage — is read from `core.py:4308-4348` and **has never been observed**. The coordination example has hit a cascade ceiling, but only as a refused *spawn* (§7.14), which is a different event; it has never seen this one on an owner's stream. | None yet. Deliberately not mitigated by guesswork: the honest state is unverified, and the test costs real money, so it is recorded rather than papered over. |
 
 ---
 
@@ -659,9 +867,14 @@ returns.
 `_maybe_unload_session` returns early while `session.attached_clients` is
 non-empty (`session_manager.py:8473`, and again at `:4931` once the model
 thread finishes). The driver's attachment therefore **pins the conscient in
-memory**: it cannot go cold while the driver holds it. That retires §7.2 for
-the conscient half, `sibling_cold` having been the absorbing state that could
-end the mind silently.
+memory**: it cannot go cold while the driver holds it, and no attach-away can
+be aimed at it while it is the client's current session.
+
+Read this as belt-and-braces rather than as the thing standing between the
+conscient and oblivion. The subconscient is not "exposed" by comparison: a
+loaded session rests only when a driver attaches away from it (§5.6 note), and
+nothing in the loop does that once it is running. What the attachment actually
+buys is the whisper channel below.
 
 It also means a transient whisper is safe. Attach → inject → disconnect fires
 `_maybe_unload_session(conscient)` on the way out, and that returns early
@@ -723,14 +936,35 @@ run an advisor on a schedule, or the mind wakes with amnesia every time.
 1. **Stuck volleys.** Nothing detects two halves circling one thought. A
    similarity check in the driver could nudge, but "the mind is ruminating" is
    a hard predicate and a wrong one is worse than none.
-2. **Cold-start recovery for the subconscient.** §8.4 settles the conscient —
-   the driver's attachment pins it. The subconscient has no attached client and
-   so remains exposed. The watchdog's `inject_prompt` reaches the conscient
-   only; whether nudging the conscient into sending is enough to revive a cold
-   subconscient depends on whether `send_to_sibling` to a cold peer stays
-   `sibling_cold` forever, which it appears to. If so the driver must detect
-   the missing half and attach to it, or re-create it. Needs a live run — and
-   it is the most likely reason a first deployment dies overnight.
+2. **Does creation order rest the subconscient?** This question used to read
+   "cold-start recovery", on the premise that an unattached sibling is exposed
+   to going cold by resting. It is not: cold is reached by a driver attaching
+   away, never by waiting (§5.6 note, `certify/c4_cold_sibling_is_queued.py`).
+   What survives is narrower and mechanical. §5.6 creates the subconscient,
+   then creates the conscient — and that second create is an attach-away from
+   the first. `_maybe_unload_session` defers while the model runs
+   (`session_manager.py:8484`), so it turns on whether the subconscient is
+   mid-turn at that instant, which nothing in the design arranges either way.
+   **ANSWERED — the order is safe as written.** The experiment was run on
+   `4138a9a5`: A created, its turn allowed to complete so it was genuinely
+   idle, then B created (the attach-away), then B→A. The send returned
+   `accepted`, and no `"Unloaded session"` line exists for A between B's
+   creation and the send — so it is *never unloaded*, not *unloaded and
+   revived by the delivery*. A had then been idle four minutes, with a
+   finished turn behind it, across another session's creation. Full timeline
+   in §5.6. What remains unknown is only the long horizon: nobody has idled a
+   sibling for an hour, and the logs give no sign of a timer that would care.
+
+   Should it ever fire, revival is not the obstacle §8.4 implied: `wake_session`
+   — the `session.wake` command, payload `{session_id, text, source, event_id}`
+   — starts a turn on a session, reviving it if cold, **with no client attached
+   and the caller not required to be one** (`session_manager.py:6820`). That is
+   why `SURFACE.md` §2.2 declined the `wake` flag: revival already exists, with
+   signature checks and event-id dedup. The wrinkle, unverified: reviving a
+   cold session with no attached client while a cid is known returns `DEFERRED`
+   rather than `OK` — the turn is held pending and a `SessionWokenEvent` goes
+   to the cascade observers, and `attach_session` drains it. Whether a deferred
+   wake ever drains for a session nobody intends to attach to is unknown.
 3. **Does GC eat the thread of thought?** `gc_hybrid` preserves recent turns and
    summarises the middle. For a monologue, the *middle* is the biography. The
    memory plugin is the durable channel, but that requires the personas to
@@ -762,6 +996,13 @@ run an advisor on a schedule, or the mind wakes with amnesia every time.
 - `jaato-server/shared/message_queue.py:16-53` — `SourceType`, and the authority tiers
 - `jaato-sdk/jaato_sdk/client/ipc.py:1622` — `attach_session`; `:1652` — `end_session`; `:2049` — `inject_prompt`; `:1310-1319` — write flush
 - `jaato-server/server/session_manager.py:6057,6655,6672` — attach / detach bookkeeping; `:4931,:8473` — the unload gate
+- `jaato-server/server/session_manager.py:345-368` — the sibling caps and why they are backpressure; `:5304` — the `refused` branch
+- `jaato-server/server/session_manager.py:6820` — `wake_session` / the `session.wake` command: cold-revive with no attached client, and the `DEFERRED` case
+- `jaato-server/server/core.py:4308-4348` — `SessionTerminatedEvent(reason="budget_exhausted")`, and why it is not an `ErrorEvent`
+- `jaato-server/shared/budget_control.py:138-156` — `CascadeBudgetExhausted.as_payload()`, the spawn-time refusal
+- `jaato-server/shared/jaato_session.py:8225-8235` — the abort rung latches the refusal; `:6311` — receipt prose becomes `error_message`
+- `jaato-server/shared/plugins/subagent/plugin.py:1117` — a non-`accepted`/`queued` receipt is a FAILED call
+- `jaato-sdk/jaato_sdk/events.py:571-577` — `SessionTerminatedEvent.reason` vocabulary and `details`; `:662-675` — `ToolCallEndEvent`
 
 **Docs**
 - `docs/design/cascade-as-client.md` — cascade as first-class client identity
@@ -772,3 +1013,5 @@ run an advisor on a schedule, or the mind wakes with amnesia every time.
 **External**
 - [`laude-institute/headlong`](https://github.com/laude-institute/headlong) — `philosophy.md`, the Thompson test
 - [`jaato-cascade-coordination-example`](https://github.com/Jaato-framework-and-examples/jaato-cascade-coordination-example) — `SURFACE.md`, `certify/`, `examples/common.py`, `examples/render_cascade.py`
+  - `certify/c4_cold_sibling_is_queued.py` — "COLD IS REACHED BY ATTACHING AWAY, not by waiting", and the retracted assumption that it is reached by resting
+  - `examples/chapter_cascade.py` — two siblings live at once over the same IPC creation path; unloading one takes a deliberate two-step attach dance
