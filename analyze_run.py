@@ -125,12 +125,13 @@ def main():
             for ln in fh:
                 if "RPC_DIAG" in ln:
                     continue
+                ts = ln[:23]          # "2026-08-25 23:03:46,123"
                 d = SIBLING_DELIVERY.search(ln)
                 if d:
-                    deliveries.append(d.groupdict())
+                    deliveries.append(dict(d.groupdict(), ts=ts))
                 k = DRAIN_SUMMARY.search(ln)
                 if k:
-                    drains.append(k.groupdict())
+                    drains.append(dict(k.groupdict(), ts=ts))
 
     print("== 0. delivery + drain (#618) ==")
     if not deliveries and not drains:
@@ -160,6 +161,38 @@ def main():
     if deliveries and not drains:
         print("  !! a send was recorded but NO drain summary — the drain did "
               "not run on that turn")
+
+    # ---- THE PAIRING: the queued send, and the FIRST drain after it ------
+    #
+    # There will be several DRAIN_SUMMARY lines. Only one answers the
+    # question: the first drain on the TARGET session whose timestamp is
+    # later than the `queued` receipt. Everything else is context. If that
+    # drain reports queue_at_entry=0, the message is not on the queue the
+    # drain reads (or never arrived); if entry>0 and drained=0, it saw it
+    # and left it.
+    print("\n  -- pairing (the queued send -> the next drain on its target) --")
+    queued = [d for d in deliveries if d["outcome"] == "queued"]
+    if not queued:
+        print("  no `queued` outcome recorded — the queue branch was not "
+              "exercised this run; the pairing has nothing to answer")
+    for q in queued:
+        later = [k for k in drains
+                 if k["ts"] > q["ts"] and k["agent"] == q["to"]]
+        print(f"  {q['ts']}  {q['frm']} -> {q['to']}  QUEUED "
+              f"(busy={q['busy']} thread_alive={q['alive']})")
+        if not later:
+            print("     -> NO drain ran on the target after this. The turn "
+                  "it was waiting on ended without one.")
+            continue
+        k = later[0]
+        entry, drained = int(k["entry"]), int(k["drained"])
+        verdict = ("MESSAGE NOT ON THE QUEUE THE DRAIN READS (or never arrived)"
+                   if entry == 0 else
+                   "SAW IT AND DID NOT TAKE IT" if drained == 0 else
+                   "COLLECTED — the strand is gone")
+        print(f"     -> {k['ts']}  drain entry={entry} drained={drained} "
+              f"passes={k['passes']} exit={k['exit']}")
+        print(f"        {verdict}")
     print()
 
     # ---- 2. turns per message, and 3. accepted-with-no-turn -------------
