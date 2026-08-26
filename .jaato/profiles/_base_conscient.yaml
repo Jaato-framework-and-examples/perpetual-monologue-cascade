@@ -30,6 +30,14 @@ gc:
   threshold_percent: 75.0
   preserve_recent_turns: 6
 plugin_configs:
+  memory:
+    # WRITE-SIDE GATE. Default is ['project','universal']; universal writes
+    # to the HOME tier (~/.jaato/memories.jsonl), outside this workspace and
+    # shared with every other jaato session on the machine. A mind thinking
+    # to itself has no business writing there — one memory already did, and
+    # it is the one that did NOT persist here. A disallowed scope is
+    # hard-rejected back to the model, so this is a gate, not a preference.
+    allowed_scopes: ["project"]
   permission:
     # `evaluators` is top-level; `defaultPolicy`/`whitelist` nest under
     # `policy` (permission/plugin.py:387-395). Flattening them silently

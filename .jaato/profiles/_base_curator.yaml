@@ -1,0 +1,41 @@
+# Tier-1 base for the curator — the mind's third resident faculty.
+name: _base_curator
+description: >
+  Curates what the mind chose to remember: drains raw memories into the
+  curated set, or dismisses them.
+
+  NOT A SIBLING. It is created under the same cascade_driver_id — so it
+  shares the one budget ceiling and the one event stream — but declares NO
+  sibling_name, so it does not appear in list_siblings and neither half can
+  address it. The thing that judges the memories is not reachable by the
+  thing that writes them.
+
+  Declares NO completion_payload_schema, like the two halves. A faculty of
+  the mind, not a service it calls: it cannot decide it is finished.
+  Withholding the schema is what removes `signal_completion` entirely.
+
+  It keeps itself alive by nothing. Unlike the halves it has no send
+  invariant — it idles until woken, and `session.wake` revives it even from
+  cold, so being unloaded between curations is harmless rather than fatal.
+plugins:
+  # preload because update_memory and delete_memory are DISCOVERY-GATED —
+  # a curator that has to call list_tools before it can promote anything
+  # spends its first turn finding its own hands.
+  - memory(preload)
+gc:
+  type: hybrid
+  threshold_percent: 75.0
+  preserve_recent_turns: 4
+plugin_configs:
+  memory:
+    allowed_scopes: ["project"]
+  permission:
+    policy:
+      defaultPolicy: deny
+      whitelist:
+        tools: [store_memory, retrieve_memories, list_memory_tags,
+                update_memory, delete_memory]
+
+# NO budget_control — §7.4, certified as C3. The cascade ceiling covers all
+# three sessions or it covers none of them.
+suppress_base_instructions: false

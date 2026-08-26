@@ -11,3 +11,4 @@ __pycache__/
 .jaato/waypoints.json
 run12-monologue.md
 run*-monologue.md
+.jaato/memories/

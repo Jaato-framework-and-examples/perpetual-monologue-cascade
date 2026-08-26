@@ -127,8 +127,15 @@ def render(ev):
         # supported flush; attaching away is not — on an already-cold
         # session it restores the STALE file and writes it back, so it
         # round-trips old data over new.
+        # THROTTLED: at most one queued save per session. Saving after
+        # EVERY send raced the framework's own turn-end save on the same
+        # per-session `.json.tmp` path — the first rename won, the second
+        # got ENOENT, and the transcript silently fell behind while the
+        # log said the save had failed. A stale transcript read afterwards
+        # is evidence about nothing, which cost a whole run's worth of
+        # conclusions.
         sid = getattr(ev, "session_id", None)
-        if sid:
+        if sid and sid not in _pending_saves:
             _pending_saves.append(sid)
     elif kind == EventType.AGENT_STATUS_CHANGED and getattr(ev, "status", "") == "done":
         _flush(who)
@@ -194,8 +201,19 @@ async def main():
     con = await client.create_session(
         profile="conscient", agent="conscient",
         sibling_name="conscient", cascade_driver_id=cid, timeout=60.0)
-    if not sub or not con:
-        raise SystemExit(f"a half did not start (sub={sub} con={con})")
+    # THE THIRD RESIDENT FACULTY. Same cid — so it is inside the one budget
+    # ceiling and on the one event stream — but NO sibling_name, so it does
+    # not appear in list_siblings and neither half can address it. The thing
+    # that judges the memories is not reachable by the things that write
+    # them. Like the halves it declares no completion schema and so cannot
+    # decide it is finished; unlike them it has no send invariant, because
+    # it is woken rather than self-sustaining.
+    cur = await client.create_session(
+        profile="curator", agent="curator",
+        cascade_driver_id=cid, timeout=60.0)
+    if not sub or not con or not cur:
+        raise SystemExit(f"a session did not start "
+                         f"(sub={sub} con={con} curator={cur})")
 
     # EXPLICIT, not incidental. create_session attaches the creating client
     # (session_manager.py:6057), so without this the driver is attached to
@@ -209,6 +227,7 @@ async def main():
     with open(os.path.join(CONFIG_ROOT, "monologue.json"), "w") as fh:
         json.dump({"cid": cid, "conscient_session_id": con,
                    "subconscient_session_id": sub,
+                   "curator_session_id": cur,
                    "started_at": time.time()}, fh)
 
     last_activity = time.monotonic()
@@ -300,6 +319,27 @@ async def main():
                     shutdown.set()
                     return
 
+                # THE MIND REMEMBERED SOMETHING -> WAKE THE CURATOR.
+                # `session.wake` and not inject_prompt: inject targets the
+                # client's ATTACHED session, and this client's one
+                # attachment belongs to the conscient (§8.4). wake takes an
+                # explicit session_id, and revives a cold target — so the
+                # curator being unloaded between curations is harmless.
+                # Fired on the RESULT, never on the call: a store that
+                # failed is not something to curate.
+                if (getattr(ev, "type", None) == EventType.TOOL_CALL_END
+                        and getattr(ev, "tool_name", "") == "store_memory"
+                        and getattr(ev, "success", False)):
+                    print(f"[{_stamp()}] .. memory stored; waking the curator",
+                          flush=True)
+                    with contextlib.suppress(Exception):
+                        await client.execute_command("session.wake", payload={
+                            "session_id": cur,
+                            "text": "The mind has just stored something. "
+                                    "Curate what is waiting.",
+                            "source": "user",
+                        })
+
                 # A failed send is still a CALL, so the persona invariant is
                 # satisfied while nothing was delivered and nothing will wake
                 # the peer (plugin.py:1117 returns (False, receipt) for
@@ -383,7 +423,8 @@ async def main():
         print(f"[{_stamp()}] unloading both halves (saving transcripts)",
               flush=True)
         with contextlib.suppress(Exception):
-            await client.attach_session(sub)
+            await client.attach_session(cur)
+            await client.attach_session(sub)   # leaving cur saves it
             await client.attach_session(con)   # leaving sub saves it
         await client.disconnect()              # leaving con saves it
 
