@@ -521,9 +521,10 @@ async def main():
         # matches a sentence, which is brittle; see §7.12.
         msg = ev.error_message or ""
         if "is resting (unloaded)" in msg:
-            # sibling_cold. NOT expected in a running loop: cold is reached
-            # by a driver attaching away, not by resting (§5.6 note). If it
-            # fires, the driver put it there — revive with `session.wake`
+            # sibling_cold. Resting never causes it (§5.6 note), but TWO
+            # things do: a driver attaching away, and a stalled daemon loop
+            # terminating the session (§7.18). render_cold prints the grep
+            # that separates them. Either is revivable with `session.wake`
             # (§11 Q2), which needs no attachment.
             render_cold(ev)
         elif "has not been idle since" in msg:
@@ -775,7 +776,7 @@ forge (`permission/channels.py:1300`; certified as C2).
 | # | Failure | Why | Mitigation |
 |---|---|---|---|
 | 7.1 | **Loop dies silently** | Nothing enforces that a turn ends with a send. The example repo's stock personas literally end with `then stop`. | The persona invariant (§5.2), plus the driver watchdog. |
-| 7.2 | **`sibling_cold` is absorbing** | A cold peer is explicitly *not* woken by a message, so if a half is ever unloaded the loop ends permanently and quietly. **Retired as written, but its MITIGATION was inert.** A sibling does not go cold by resting or by ending a turn — cold is reached by a driver attaching away (§5.6, `c4`), and the one gesture this driver makes was measured harmless (§11 Q2). The danger was never coldness; it was §7.14. | Nothing to do about coldness. **But the watchdog nudge this row promised as the backstop did nothing at all** until PR #617 — see §7.14. Watchdog nudge via `inject_prompt` as a backstop — heartbeat, not courier. `session.wake` revives a cold half if one ever appears, with no attachment needed. |
+| 7.2 | **`sibling_cold` is absorbing** | A cold peer is explicitly *not* woken by a message, so if a half is ever unloaded the loop ends permanently and quietly. **Un-retired — the row was right and the reasoning under it was wrong.** A sibling does not go cold by resting or by ending a turn, and the one attach-away this driver makes was measured harmless (§5.6, `c4`, §11 Q2). But attaching away is not the only road to cold: a stalled daemon loop is terminal to the session that is unlucky enough to have a coroutine scheduled across it (§7.18), and the unload that follows is the framework working correctly on top of a session that should never have died. **Observed on runs 26 and 27, ~3 minutes in, both times — this is the normal end of a run, not an edge case.** The danger was §7.14; it is now this. | Nothing to do about coldness. **But the watchdog nudge this row promised as the backstop did nothing at all** until PR #617 — see §7.14. Watchdog nudge via `inject_prompt` as a backstop — heartbeat, not courier. `session.wake` revives a cold half if one ever appears, with no attachment needed. |
 | 7.3 | **No throttle, no completion** | `accepted` starts a turn immediately; and a session's only exit is `signal_completion`, which a perpetual session never calls — so `await_completion` never fires. | Pacer evaluator (§5.4) for rate. Termination is **two parts, not one**: the ceiling only makes each session refuse further turns (latched, `jaato_session.py:8233`) and emit `SessionTerminatedEvent(reason="budget_exhausted")`; the driver observes that and calls `delete_session` (§5.6). Soft `DENY_WITH_COMMENT` wind-down first, then the hard clamp, then the reap. |
 | 7.4 | **The budget hole** | A profile declaring its own `budget_control` is accounted separately and **skipped by the cascade pool** — with both profiles declaring one, the ceiling watches nothing. | Neither sibling profile may declare `budget_control`. This is certified as C3, not a style preference. |
 | 7.5 | **Permission stall** | `send_to_sibling` is permission-gated; a headless loop has nobody to answer the prompt. | Profile-level whitelist (§5.3). Note evaluators still run over it. |
@@ -789,8 +790,9 @@ forge (`permission/channels.py:1300`; certified as C2).
 | 7.13 | **The ceiling leaks the cascade** | A budget refusal terminates nothing (§5.6). With `observe()` and `watchdog()` both looping forever, `gather` never returns, the `finally` that reaps both sessions is unreachable, and §8.4's attachment pins the conscient in memory indefinitely. The watchdog then live-locks: nudge at `STALL_AFTER` → the exhausted session refuses → the refusal emits an event → `last_activity` resets → nudge again, forever, in a process that can no longer do anything. | A `shutdown` event set from `SessionTerminatedEvent(reason="budget_exhausted")`, a watchdog that awaits it instead of sleeping blind, and `aclosing()` on the iterator (§5.6). |
 | 7.14 | **An idle session is UNREACHABLE, and the unreachability is self-sealing** | **The bug that defeats this design. Reproduced 5/5, root-caused with the framework owner.** `JaatoSession.inject_prompt` starts a turn only when `_activity_phase == IDLE` AND `not _is_running` AND `_on_continuation_needed` is installed — and that callback exists only for the duration of a `session.send_message` RPC (`jaato_session.py:1400`). So on a genuinely idle session it always queues, and nothing drains that queue: the only drainers are mid-turn yield points and the end-of-turn drain, both of which need a turn that is not happening. Worse, the SDK's `client.inject_prompt` reaches the runner through a handler that never calls `deliver()` and makes NO busy/idle decision at all (`session_manager.py:9868`) — so it cannot start a turn under any circumstances, on any session, in any state. | **None available to this design.** The driver's whole recovery mechanism — nudge on silence — cannot work BY CONSTRUCTION, because the nudge lands in the same dead queue as the message it was sent to rescue. Measured: the conscient's queue grows 1 → 2 → 3 (one sibling message, then both watchdog nudges) and is never popped. A stranded session is not stalled, it is unreachable, and the recovery channel is the broken one. **PR #619 fixes the RECOVERY half**: `InjectPromptRequest` now routes through the queue-or-drive decision instead of forwarding blind, so a nudge to an idle session drives a turn and `inject_prompt` returns a real status (`accepted`/`queued`/`terminated`/`no_session`/`unreachable`) rather than silence. **It does not fix the sibling strand.** And the cause is NOT where an earlier version of this row put it: the drain's placement is correct. The runner marks itself not-running (`jaato_session.py:5801`), sets `IDLE` (`:5804`), and only THEN drains (`:5844`, the last statement) — the intended "drain anything queued before going idle" is implemented. It cannot help, because the message arrives after that point. Run 12: the conscient drained at 08:59:11 with `queue_at_entry=0` and the reply arrived at 08:59:41, thirty seconds after that turn was over. **The defect is that the sender was told `busy=True` about a session that had been idle for half a minute** — the daemon decides queue-or-drive from `JaatoServer._model_running`, a DIFFERENT OBJECT from the runner's `_is_running`, on the far side of the RPC, and its copy cannot clear until the `send_message` RPC unwinds. Idle would have meant DRIVEN (#612) and the loop would never have stalled. So no amount of draining fixes this: a message arriving after the last drain needs to START a turn, and it was denied that on a stale flag. The fix is to move the busy/idle decision to the runner, which owns the authoritative one.<br><br>**Measured on `d5b6d716`: the strand becomes TRANSIENT — but read the precondition.** A stranded message is collected by the end-of-turn drain of ANY subsequent turn (#617's loop), so it is delayed rather than lost — 3.5 minutes in run 12. Recovery does not come from the strand healing itself; **it comes from something starting a NEXT TURN.** #619 did not make the strand recoverable, it made the RECOVERER work, and the recoverer was already there. So: *a strand is terminal when nothing can start a turn, and transient when something can.* This design's watchdog is that something. **A pure symmetric pair with no driver and no nudge still has nothing to start the next turn, so for that topology the strand remains TERMINAL** — it merely stops looking terminal in any bench that has a watchdog. Do not carry "self-healing" without this sentence attached. |
 | 7.15 | **`#617` and `#618` do NOT fix this** | Recorded because an earlier version of this row said they did. #617 loops the end-of-turn drain and #618 adds `SIBLING_DELIVERY` / `DRAIN_SUMMARY` diagnostics; both are real and both were necessary to find the cause. Neither reaches §7.14, because looping a drain does not help a message that arrives after the last turn-end, and a diagnostic does not fix what it reveals. Certified on `e5ef1003` and `8d89ffc1`: strands on both. #619 fixes half — the session stops being unreachable, the sibling strand remains. | Do not read a merged fix as a fixed bug without a run that says so. This design does not work on ANY current framework version. |
-| 7.15 | **A live session's transcript cannot be read** | A `send_to_sibling` receipt is readable in exactly one place — the sending session's saved history. No cascade event carries the body, and `ToolCallEndEvent.success` is True for both `accepted` and `queued`, so the driver cannot tell them apart live. History is written on SAVE, and a session under diagnosis has not saved. Forcing it by attaching away is a side effect standing in for an interface, and a silent no-op when the client is attached elsewhere — which is what happened here: the subconscient's file stayed pinned at the instant it sent, so its receipt was never obtainable. | `session.save [id]` shipped in #617; `SessionManager.save_session` had always existed with nothing exposing it. Until then the receipt is only the model's word for it. |
+| 7.16 | **A live session's transcript cannot be read** | A `send_to_sibling` receipt is readable in exactly one place — the sending session's saved history. No cascade event carries the body, and `ToolCallEndEvent.success` is True for both `accepted` and `queued`, so the driver cannot tell them apart live. History is written on SAVE, and a session under diagnosis has not saved. Forcing it by attaching away is a side effect standing in for an interface, and a silent no-op when the client is attached elsewhere — which is what happened here: the subconscient's file stayed pinned at the instant it sent, so its receipt was never obtainable. | `session.save [id]` shipped in #617; `SessionManager.save_session` had always existed with nothing exposing it. Until then the receipt is only the model's word for it. |
 | 7.17 | **A refused spawn is silent, and silence looks like work** | `cascade_budget_set` runs before the sessions are created, so a cid with no headroom refuses the spawn — correctly — but the refusal is logged daemon-side and is invisible to the client, indistinguishable from a slow turn. The coordination example's driver hung fifteen minutes on it. | Call `cascade_budget_get` before drawing any conclusion from silence. Reported from their run; not hit here. |
+| 7.18 | **A stalled daemon loop is fatal, not slow** | The daemon loop stops running scheduled coroutines for 5-35s. Survivable in itself — a `session_get_history` that misses its window fails a save and logs. But `session_get_context_usage` is called from the MODEL thread, whose `except Exception` classifies nothing, so a 10s outer timeout with no inner (which per #627 means the loop never ran the coroutine, not that the RPC was slow) becomes `SessionTerminatedEvent(reason=error)` — the same branch as a revoked API key. `_apply_default_cascade_policy` then unloads the session, and it is cold. **Same stall, different victim, wildly different consequence.** Measured: runs 26 and 27, ~3 min in, both times the subconscient, on two daemon builds. The framework has `classify_error` and a `transient` flag; this catch-all sits downstream of all of it. | Nothing available here — it is one `except` clause in the framework, reported to the owner as their highest-severity open item. Locally: `grep MODEL_THREAD_TERMINAL_ERROR` on the daemon log to tell this apart from an attach-away (§7.2), and expect ~3 good minutes per run until it lands. |
 
 ---
 
@@ -954,6 +956,33 @@ not optional.** Enrichment surfaces *curated* memories only
 resurface unless something drains raw→curated. Wire the curator as a reactor or
 run an advisor on a schedule, or the mind wakes with amnesia every time.
 
+**It is wired, it fires, and the mind still wakes with amnesia — for a reason
+one layer down.** The driver creates a resident curator and wakes it on every
+successful `store_memory` (§7.2 of RUNNING.md has the operational detail). The
+chain is confirmed end to end: store, wake, cold revival, curator turn. The
+curator then reports an empty store, and it is not wrong to.
+`MemoryStore.search_by_maturity` — documented "Curator-facing maturity query",
+correct, unit-tested — has **zero production callers**. `_execute_retrieve`
+routes every non-`ids` query through `search_by_tags`, which reads
+`curated.jsonl` only, so `retrieve_memories(maturity="raw")` cannot reach the
+raw queue that the shipped `memory-advisor` persona, the plugin's own class
+docstring, and the tool schema all say it reaches. Regression origin:
+`3f019999`, which split the raw queue from the curated store and never
+repointed the handler.
+
+The instrument compounds it. `list_memory_tags` computes `count_by_maturity()`
+on every call — which *does* count the raw queue — then returns `memory_count`
+from the curated-built indexer and routes the true `count_raw` into
+`_telemetry`. It answers "Found 0 memories" while holding "raw: 12" in the same
+dict, so a curator reasoning correctly from it concludes the store is empty
+rather than unreadable. **Absent read as empty**, which is §7.17's failure mode
+wearing different clothes.
+
+So this section's claim is upgraded, not retired: continuity is not
+unimplemented, it is one branch in `_execute_retrieve` away. Twelve raw
+memories are on disk right now, zero curated. Reported to the framework owner;
+nothing in this repo changes when it lands.
+
 ---
 
 ## 10. What this is not
@@ -981,8 +1010,11 @@ run an advisor on a schedule, or the mind wakes with amnesia every time.
    a hard predicate and a wrong one is worse than none.
 2. **Does creation order rest the subconscient?** This question used to read
    "cold-start recovery", on the premise that an unattached sibling is exposed
-   to going cold by resting. It is not: cold is reached by a driver attaching
-   away, never by waiting (§5.6 note, `certify/c4_cold_sibling_is_queued.py`).
+   to going cold by resting. It is not — but "never by waiting" was too strong,
+   and the runs corrected it. Resting is safe (§5.6 note,
+   `certify/c4_cold_sibling_is_queued.py`); a driver attaching away is one road
+   to cold, and **a stalled daemon loop is the other** (§7.18), which no amount
+   of care in this repo prevents.
    What survives is narrower and mechanical. §5.6 creates the subconscient,
    then creates the conscient — and that second create is an attach-away from
    the first. `_maybe_unload_session` defers while the model runs
@@ -1007,7 +1039,15 @@ run an advisor on a schedule, or the mind wakes with amnesia every time.
    cold session with no attached client while a cid is known returns `DEFERRED`
    rather than `OK` — the turn is held pending and a `SessionWokenEvent` goes
    to the cascade observers, and `attach_session` drains it. Whether a deferred
-   wake ever drains for a session nobody intends to attach to is unknown.
+   wake ever drains for a session nobody intends to attach to **is no longer
+   unknown: it does.** The curator (§9) is exactly that session — created
+   with a cid, never attached to, unloaded between curations — and the driver
+   wakes it on every `store_memory`. Run 26: stored 16:21:33, cold session
+   revived 16:21:37 (`Restored budget usage for session ...`), curator turn
+   ran and produced output at 16:22:24. Run 27 repeated it. So a deferred wake
+   drains on its own, with no attachment and no observer intervention. What it
+   drains INTO is a session that cannot read its own queue, but that is §9's
+   problem, not this one's.
 3. **Does GC eat the thread of thought?** `gc_hybrid` preserves recent turns and
    summarises the middle. For a monologue, the *middle* is the biography. The
    memory plugin is the durable channel, but that requires the personas to
