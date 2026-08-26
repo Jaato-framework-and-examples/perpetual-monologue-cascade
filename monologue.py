@@ -457,11 +457,23 @@ async def main():
         # fourteen-stall sample — the one that would have answered whether
         # the daemon-loop stall tracks output volume. Optimising for a clean
         # read instead of a comparable one.
-        for _h in ("conscient", "subconscient"):
+        # THREE, not two. The curator was left out of this loop while it was
+        # the only session with no trace to archive; now that it has one, an
+        # omission here would quietly overwrite it on the next run — the same
+        # way a fixed path plus `rm` destroyed run 21's sample.
+        # THREE sessions, and the curator writes TWO files: the provider
+        # trace (budget/tokens) and the PLUGIN trace, which is the only one
+        # carrying `update_memory: id=..., maturity=...`. Archiving one and
+        # not the other would leave the answer to be overwritten by the next
+        # run — the same way a fixed path plus `rm` destroyed run 21's sample.
+        _traces = [f"/tmp/mono-trace-{_h}.log"
+                   for _h in ("conscient", "subconscient", "curator")]
+        _traces.append("/tmp/mono-plugin-curator.log")
+        for src in _traces:
             with contextlib.suppress(Exception):
-                src = f"/tmp/mono-trace-{_h}.log"
                 if os.path.isfile(src):
-                    os.replace(src, f"/tmp/mono-trace-{_h}-{_run_id}.log")
+                    stem = src[:-len(".log")]
+                    os.replace(src, f"{stem}-{_run_id}.log")
         print(f"[{_stamp()}] unloading both halves (saving transcripts)",
               flush=True)
         with contextlib.suppress(Exception):
