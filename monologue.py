@@ -162,9 +162,15 @@ def render_ceiling(details):
 
 def render_cold(ev):
     print(f"[{_stamp()}] !! a half went cold: {ev.error_message}", flush=True)
-    print("   Not expected in a running loop — cold is reached by a driver "
-          "attaching away, not by resting. If this fires, something "
-          "attached away from it. See README §11 Q2.", flush=True)
+    print("   Two causes, and they want opposite responses. Either the driver "
+          "attached away (§5.6) — this driver's one such gesture was measured "
+          "harmless, so suspect your own code — or the daemon loop stalled and "
+          "the model thread's bare `except Exception` terminated the session "
+          "(§7.18). Tell them apart:", flush=True)
+    print("     grep MODEL_THREAD_TERMINAL_ERROR <daemon log>", flush=True)
+    print("   Present: the framework killed it, nothing here did. Absent: "
+          "something attached away. Either is revivable with `session.wake`, "
+          "which needs no attachment (§11 Q2).", flush=True)
 
 
 def render_backpressure(ev):
