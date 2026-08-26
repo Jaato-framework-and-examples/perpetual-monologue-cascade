@@ -15,4 +15,9 @@ plugin_configs:
       # the one knob where the monologue deliberately parts company with
       # the determinism budget.
       temperature: 0.8
-      max_tokens: 1200
+      # A CHAIN of thoughts needs room for several links plus their tool calls.
+      # At 1200 the conscient hit the cap mid-first-thought and never reached
+      # send_to_sibling, so the turn ended with no send and the loop never
+      # started. max_tokens can violate the persona's one invariant
+      # unilaterally — no prose defends against being cut off.
+      max_tokens: 4000

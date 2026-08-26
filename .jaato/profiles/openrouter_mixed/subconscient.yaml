@@ -11,4 +11,7 @@ plugin_configs:
       # Higher than the conscient's. The associative half's whole job is
       # the angle that was not taken; it is the half that should wander.
       temperature: 1.0
-      max_tokens: 600
+      # At 600 an association reaching for the memory tool was truncated
+      # mid-sentence (run 12). A fragment that arrives looking complete is
+      # worse than a short one.
+      max_tokens: 1500

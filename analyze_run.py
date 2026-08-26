@@ -34,12 +34,15 @@ DRAIN_ONE = re.compile(
     r"DRAIN_(?P<tier>\w+)_MESSAGE: agent_id=(?P<agent>[^,]*), "
     r"source_type=(?P<src>[^,]*), source_id=(?P<sid>[^,]*)")
 
+#: #620 renamed `busy=` to `replica_busy=` — deliberately, so that
+#: `replica_busy=True outcome=accepted` is direct evidence the stale
+#: flag was OVERRIDDEN rather than merely absent. Match both.
 #: #618. Daemon log, greppable with nothing configured — deliberately, so
 #: the diagnostic is readable during the run it is needed for rather than
 #: after it.
 SIBLING_DELIVERY = re.compile(
     r"SIBLING_DELIVERY: from=(?P<frm>\S+) to=(?P<to>\S+) "
-    r"target_session=(?P<sess>\S+) busy=(?P<busy>\S+) "
+    r"target_session=(?P<sess>\S+) (?:replica_)?busy=(?P<busy>\S+) "
     r"thread_alive=(?P<alive>\S+) outcome=(?P<outcome>\S+)")
 
 #: #618. The half neither instrument could see: whether a drain pass ran at

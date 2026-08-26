@@ -9,3 +9,5 @@ __pycache__/
 .jaato/.artifact_tracker.json
 .jaato/todos/
 .jaato/waypoints.json
+run12-monologue.md
+run*-monologue.md

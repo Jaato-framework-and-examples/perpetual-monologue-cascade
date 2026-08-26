@@ -19,6 +19,7 @@ WHAT IS VERIFIED AND WHAT IS NOT (README §4.1, §7.15):
 """
 import asyncio
 import contextlib
+import signal
 import json
 import os
 import time
@@ -213,6 +214,18 @@ async def main():
     last_activity = time.monotonic()
     shutdown = asyncio.Event()      # set by the ceiling; awaited by both tasks
 
+    # SIGTERM MUST REACH THE SAME SHUTDOWN PATH AS THE CEILING.
+    # Killing the driver does NOT stop its sessions — they stay loaded and
+    # keep volleying at each other with nobody watching, and their sends
+    # then fail into the next run's log as ghosts ("could not be reached").
+    # Several runs' worth of noise came from exactly that. A signal handler
+    # that sets `shutdown` lets the `finally` unload both halves, which is
+    # the difference between stopping a driver and stopping a mind.
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        with contextlib.suppress(NotImplementedError):
+            loop.add_signal_handler(sig, shutdown.set)
+
     async def on_failed_send(ev):
         # The receipt STATUS is not on the event — only the prose the
         # receipt's `error` key carried (jaato_session.py:6311). So this
@@ -242,6 +255,8 @@ async def main():
                 client.cascade_events(cid, event_types=None,
                                       role="owner")) as stream:
             async for ev in stream:
+                if shutdown.is_set():
+                    return          # signal arrived; let the finally reap
                 render(ev)
                 while _pending_saves:
                     with contextlib.suppress(Exception):
@@ -337,7 +352,14 @@ async def main():
                 last_activity = time.monotonic()
 
     # The one outbound call into the loop. Everything after is observation.
-    await client.send_message("Begin. Send your first thought to subconscient.")
+    # The kickoff is the FIRST THOUGHT'S PROMPT, not an instruction to write
+    # a message. "Send your first thought to subconscient" framed the whole
+    # stream as correspondence and contradicted the persona in the same
+    # breath — the model was told to think freely and then addressed as a
+    # correspondent by the only sentence it had to go on.
+    await client.send_message(
+        "Begin thinking. Follow whatever is actually on your mind, one "
+        "thought leading to the next.")
 
     try:
         await asyncio.gather(observe(), watchdog())

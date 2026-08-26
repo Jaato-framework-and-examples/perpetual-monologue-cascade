@@ -32,7 +32,7 @@ env:
   # "I cannot rule out interleaving" caveat. Set here rather than in .env
   # because profile env is the only layer that can differ per session.
   JAATO_PROVIDER_TRACE: "/tmp/mono-trace-subconscient.log"
-  MONOLOGUE_INTERVAL_SECONDS: "8.0"
+  MONOLOGUE_INTERVAL_SECONDS: "5.0"
   MONOLOGUE_THOUGHT_CEILING: "1000"
 
 # NO budget_control — README §7.4, certified as C3.
