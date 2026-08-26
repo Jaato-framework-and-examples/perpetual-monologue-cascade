@@ -33,11 +33,18 @@ the session is unloaded. It is then **cold**, and a cold sibling is not
 woken by a sibling message — so the surviving half spends the rest of the
 run sending into a corpse and collecting `sibling_cold`.
 
-The driver prints `!! a half went cold` and says this is not expected in a
-running loop. That message predates this finding and is now half wrong:
-README §7.2 and §11 Q2 both say cold is reached only by a driver attaching
-away. **That is no longer the only way.** A stall that lands on the wrong
-coroutine reaches it too.
+The driver prints `!! a half went cold` and then the grep that tells the two
+causes apart:
+
+```bash
+grep MODEL_THREAD_TERMINAL_ERROR <daemon log>
+```
+
+**Present: the framework killed it and nothing here did. Absent: something
+attached away**, which is a bug in your code — this driver's one attach-away
+is measured harmless (README §5.6, `c4`). Either is revivable with
+`session.wake`, which needs no attachment (§11 Q2). The failure is recorded
+as README §7.18.
 
 Reported with jaato-30; it is their highest-severity open item. Until it
 lands, expect roughly three good minutes per run — which is enough to read
