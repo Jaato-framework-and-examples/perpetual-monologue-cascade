@@ -12,4 +12,10 @@ plugin_configs:
       # Lower than either half. Curation is a judgement that should be
       # repeatable; the wandering belongs upstream of it.
       temperature: 0.3
-      max_tokens: 2500
+      # Insurance for the BATCH, not licence for the queue. The bound
+      # that matters is `limit=8` in the persona — a ceiling only moves
+      # the cliff, it does not stop a queue read whole from spending the
+      # whole waking on reading. Raised from 2500 because a truncated
+      # curator decides nothing and the queue then grows faster, which is
+      # the feedback loop this pair of changes exists to break.
+      max_tokens: 4000
