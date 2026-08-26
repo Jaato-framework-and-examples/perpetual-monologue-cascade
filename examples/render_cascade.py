@@ -108,6 +108,107 @@ def _timeline(docs: List[dict]) -> List[str]:
     return out + [""]
 
 
+def _steps(doc: dict) -> List[dict]:
+    """One entry per model step, carrying a real timestamp.
+
+    History rows are NOT timestamped — the module docstring says so, and it
+    is why the Handoffs table was the only chronological view here. But the
+    Nth tool-call part in ``history`` is the Nth record in
+    ``turn_accounting[*].function_calls``, and those carry ``start_time``.
+    Verified on run 34: conscient 24 call-parts against 24 records, same
+    names in the same order; subconscient 11 against 11. So the alignment is
+    positional and exact, not a heuristic match on name or content.
+
+    A step whose model message made no call has no timestamp of its own. It
+    INHERITS the last one seen in its own session and is flagged, because
+    inventing a time would put prose in a place the evidence does not.
+    """
+    ta_calls = [c for row in doc.get("turn_accounting") or []
+                for c in (row.get("function_calls") or [])
+                if isinstance(c, dict)]
+    steps: List[dict] = []
+    idx = 0
+    last_ts = ""
+    for message in doc.get("history") or []:
+        if message.get("role") != "model":
+            continue
+        prose, calls, ts = [], [], None
+        for part in message.get("parts") or []:
+            text = (part.get("text") or "").strip()
+            if text:
+                prose.append(text)
+            if part.get("name"):
+                when = ""
+                if idx < len(ta_calls):
+                    when = ta_calls[idx].get("start_time") or ""
+                idx += 1
+                if when and ts is None:
+                    ts = when
+                calls.append((part["name"], part.get("args") or {}))
+        if not prose and not calls:
+            continue
+        exact = ts is not None
+        if exact:
+            last_ts = ts
+        steps.append({"ts": ts or last_ts, "exact": exact,
+                      "prose": "\n".join(prose), "calls": calls})
+    return steps
+
+
+def _cell(step: dict, workspace: Optional[str], limit: int = 420) -> str:
+    """One step as a table cell: prose, then what it did."""
+    body = _clean(step["prose"], workspace).strip()
+    if len(body) > limit:
+        body = body[:limit].rstrip() + " …"
+    bits = [body] if body else []
+    for name, args in step["calls"]:
+        detail = ""
+        if name == "send_to_sibling":
+            msg = _clean(str(args.get("message", "")), workspace)
+            detail = f": {msg[:160]}…" if len(msg) > 160 else f": {msg}"
+        elif args:
+            detail = f": {_clean(json.dumps(args), workspace)[:90]}"
+        bits.append(f"**→ `{name}`**{detail}")
+    out = "<br><br>".join(bits).replace("|", "\\|").replace("\n", "<br>")
+    return out or "&nbsp;"
+
+
+def _side_by_side(docs: List[dict]) -> List[str]:
+    """The two halves in parallel, in real time.
+
+    The per-session sections below are complete but sequential: to see what
+    the other half was doing while this one thought, you have to hold two
+    places in one document. This puts them in one column each, merged on the
+    timestamps recovered in ``_steps``, so a thought and the thought it
+    crossed sit on the same row.
+    """
+    sibs = [d for d in docs if d.get("sibling_name")]
+    if len(sibs) != 2:
+        return []
+    left, right = sibs[0], sibs[1]
+    lname = left["sibling_name"]
+    rname = right["sibling_name"]
+    rows = ([(st["ts"], st["exact"], 0, st) for st in _steps(left)]
+            + [(st["ts"], st["exact"], 1, st) for st in _steps(right)])
+    if not rows:
+        return []
+    rows.sort(key=lambda r: (r[0], r[2]))
+    out = ["## Side by side", "",
+           f"Both halves in real time, `{lname}` left and `{rname}` right. "
+           "Merged on per-step timestamps recovered by position from "
+           "`turn_accounting`; a time in *italics* was inherited from the "
+           "step before because that step made no call and history carries "
+           "no clock of its own.", "",
+           f"| time | `{lname}` | `{rname}` |", "|---|---|---|"]
+    for ts, exact, side, step in rows:
+        when = ts[11:19] if ts else "?"
+        when = when if exact else f"*{when}*"
+        cell = _cell(step, (left if side == 0 else right).get("workspace_path"))
+        out.append(f"| {when} | {cell} |  |" if side == 0
+                   else f"| {when} |  | {cell} |")
+    return out + [""]
+
+
 def _session(doc: dict) -> List[str]:
     workspace = doc.get("workspace_path")
     who = doc.get("sibling_name") or "(unaddressed)"
@@ -174,6 +275,7 @@ def render(cascade: Optional[str] = None) -> str:
     out = [f"# Cascade `{cid[:12]}`", "",
            f"{len(docs)} session(s): {roles}.", ""]
     out += _timeline(docs)
+    out += _side_by_side(docs)
     for doc in docs:
         out += ["---", ""] + _session(doc)
     return "\n".join(out)
