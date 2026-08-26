@@ -108,6 +108,191 @@ def _timeline(docs: List[dict]) -> List[str]:
     return out + [""]
 
 
+def _steps(doc: dict) -> List[dict]:
+    """One entry per model step, carrying a real timestamp.
+
+    History rows are NOT timestamped — the module docstring says so, and it
+    is why the Handoffs table was the only chronological view here. But the
+    Nth tool-call part in ``history`` is the Nth record in
+    ``turn_accounting[*].function_calls``, and those carry ``start_time``.
+    Verified on run 34: conscient 24 call-parts against 24 records, same
+    names in the same order; subconscient 11 against 11. So the alignment is
+    positional and exact, not a heuristic match on name or content.
+
+    A step whose model message made no call has no timestamp of its own. It
+    INHERITS the last one seen in its own session and is flagged, because
+    inventing a time would put prose in a place the evidence does not.
+    """
+    ta_calls = [c for row in doc.get("turn_accounting") or []
+                for c in (row.get("function_calls") or [])
+                if isinstance(c, dict)]
+    hist_calls = [p for m in doc.get("history") or []
+                  if m.get("role") == "model"
+                  for p in (m.get("parts") or []) if p.get("name")]
+
+    # THE ALIGNMENT MUST BE PROVEN PER SESSION, NOT ASSUMED.
+    #
+    # It held exactly on run 34 (24 against 24, 11 against 11) and I
+    # generalised from that without testing a second cascade.  Run 36 says
+    # otherwise: conscient 0 accounting records against 9 calls, curator 9
+    # against 18, and run 34's own curator 40 against 0.  `turn_accounting`
+    # is written on save, so a session saved mid-turn has less than its
+    # history — and a session whose history was trimmed has more.
+    #
+    # Unguarded positional indexing does not merely MISS a timestamp there;
+    # it silently attaches the WRONG one, which is worse than none because
+    # the reader cannot see it happen.  So: align only over the overlap,
+    # and only while the names still agree.  The first disagreement ends
+    # the anchored region for that session.
+    anchored = 0
+    for a, b in zip(ta_calls, hist_calls):
+        if a.get("name") != b.get("name"):
+            break
+        anchored += 1
+
+    steps: List[dict] = []
+    idx = 0
+    last_ts = ""
+    for message in doc.get("history") or []:
+        if message.get("role") != "model":
+            continue
+        prose, calls, ts = [], [], None
+        for part in message.get("parts") or []:
+            text = (part.get("text") or "").strip()
+            if text:
+                prose.append(text)
+            if part.get("name"):
+                when = ""
+                if idx < anchored:
+                    when = ta_calls[idx].get("start_time") or ""
+                idx += 1
+                if when and ts is None:
+                    ts = when
+                calls.append((part["name"], part.get("args") or {}))
+        if not prose and not calls:
+            continue
+        exact = ts is not None
+        if exact:
+            last_ts = ts
+        steps.append({"ts": ts or last_ts, "exact": exact,
+                      "prose": "\n".join(prose), "calls": calls})
+    return steps
+
+
+def _cell(step: dict, workspace: Optional[str], limit: int = 420) -> str:
+    """One step as a table cell: prose, then what it did."""
+    body = _clean(step["prose"], workspace).strip()
+    if len(body) > limit:
+        body = body[:limit].rstrip() + " …"
+    bits = [body] if body else []
+    for name, args in step["calls"]:
+        detail = ""
+        if name == "send_to_sibling":
+            msg = _clean(str(args.get("message", "")), workspace)
+            detail = f": {msg[:160]}…" if len(msg) > 160 else f": {msg}"
+        elif args:
+            detail = f": {_clean(json.dumps(args), workspace)[:90]}"
+        bits.append(f"**→ `{name}`**{detail}")
+    out = "<br><br>".join(bits).replace("|", "\\|").replace("\n", "<br>")
+    return out or "&nbsp;"
+
+
+def _side_by_side(docs: List[dict]) -> List[str]:
+    """The two halves in parallel, in real time.
+
+    The per-session sections below are complete but sequential: to see what
+    the other half was doing while this one thought, you have to hold two
+    places in one document. This puts them in one column each, merged on the
+    timestamps recovered in ``_steps``, so a thought and the thought it
+    crossed sit on the same row.
+    """
+    sibs = [d for d in docs if d.get("sibling_name")]
+    if len(sibs) != 2:
+        return []
+    left, right = sibs[0], sibs[1]
+    lname = left["sibling_name"]
+    rname = right["sibling_name"]
+    lsteps, rsteps = _steps(left), _steps(right)
+    rows = ([(st["ts"], st["exact"], 0, st) for st in lsteps]
+            + [(st["ts"], st["exact"], 1, st) for st in rsteps])
+    if not rows:
+        return []
+
+    # A COLUMN WITH NO ANCHOR CANNOT BE PLACED AGAINST THE OTHER.
+    #
+    # Inheriting a time works WITHIN a session, where the steps are already
+    # in order and an unanchored step sits between two known neighbours.
+    # It does not work when a session has no anchored step at all: there is
+    # nothing to inherit from, every row lands at the empty string, and the
+    # whole column sorts to the top as though that half thought everything
+    # before the other half began.  That is a fabricated chronology, and it
+    # looks exactly like a real one — so refuse it and say why.
+    lanch = sum(1 for st in lsteps if st["exact"])
+    ranch = sum(1 for st in rsteps if st["exact"])
+
+    # A COLUMN WITH NO ANCHOR AT ALL STILL GETS RENDERED — but by SEQUENCE,
+    # and labelled as such.
+    #
+    # Inheriting a time works WITHIN a session, where an unanchored step
+    # sits between two known neighbours.  It does not work when a session
+    # has no anchored step anywhere: there is nothing to inherit, every row
+    # lands on the empty string, and the column sorts to the top as though
+    # that half thought everything before the other half began.  That is a
+    # fabricated chronology that reads exactly like a real one.
+    #
+    # Refusing outright was the first fix and it was too blunt — an
+    # incomplete view beats no view.  So such a column is SPREAD across the
+    # other half's measured span in its own order, its time cell shows a
+    # dash rather than a number, and the header says it is placed by
+    # sequence.  The order within it is real; the position against the
+    # other column is not, and nothing in the output implies otherwise.
+    def _spread(steps: List[dict], anchors: List[str]) -> None:
+        if not anchors or len(steps) < 1:
+            return
+        lo, hi = anchors[0], anchors[-1]
+        for n, st in enumerate(steps):
+            st["ts"] = lo if len(steps) == 1 else (
+                lo if n * 2 < len(steps) else hi)
+            st["placed"] = True
+
+    lts = sorted(st["ts"] for st in lsteps if st["exact"])
+    rts = sorted(st["ts"] for st in rsteps if st["exact"])
+    if not lanch and rts:
+        _spread(lsteps, rts)
+    if not ranch and lts:
+        _spread(rsteps, lts)
+
+    rows = ([(st["ts"], st["exact"], 0, st) for st in lsteps]
+            + [(st["ts"], st["exact"], 1, st) for st in rsteps])
+
+    rows.sort(key=lambda r: (r[0], r[2]))
+    def _cov(name, anch, steps):
+        if anch:
+            return f"`{name}` {anch}/{len(steps)} steps anchored"
+        return (f"`{name}` has NO recoverable timestamp — its {len(steps)} "
+                "steps are in their own true order but are placed against "
+                "the other column by sequence, not measured")
+
+    out = ["## Side by side", "",
+           f"Both halves, `{lname}` left and `{rname}` right. Times come "
+           "from `turn_accounting`, matched to history by position over the "
+           "region where the two call sequences still agree: "
+           f"{_cov(lname, lanch, lsteps)}; {_cov(rname, ranch, rsteps)}. "
+           "A time in *italics* was inherited from the step before, because "
+           "that step made no call and history carries no clock of its own; "
+           "a dash means the step could not be timed at all.", "",
+           f"| time | `{lname}` | `{rname}` |", "|---|---|---|"]
+    for ts, exact, side, step in rows:
+        if step.get("placed") or not ts:
+            when = "—"
+        else:
+            when = ts[11:19] if exact else f"*{ts[11:19]}*"
+        cell = _cell(step, (left if side == 0 else right).get("workspace_path"))
+        out.append(f"| {when} | {cell} |  |" if side == 0
+                   else f"| {when} |  | {cell} |")
+    return out + [""]
+
+
 def _session(doc: dict) -> List[str]:
     workspace = doc.get("workspace_path")
     who = doc.get("sibling_name") or "(unaddressed)"
@@ -174,6 +359,7 @@ def render(cascade: Optional[str] = None) -> str:
     out = [f"# Cascade `{cid[:12]}`", "",
            f"{len(docs)} session(s): {roles}.", ""]
     out += _timeline(docs)
+    out += _side_by_side(docs)
     for doc in docs:
         out += ["---", ""] + _session(doc)
     return "\n".join(out)
