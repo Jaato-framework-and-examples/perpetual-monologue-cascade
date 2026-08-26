@@ -39,6 +39,10 @@ env:
   # lines, which makes every claim drawn from it carry an
   # "I cannot rule out interleaving" caveat. Set here rather than in .env
   # because profile env is the only layer that can differ per session.
+  # Fixed path; the DRIVER archives it per run (see monologue.py).
+  # A ${VAR} here would be expanded by the DAEMON, which never sees
+  # the driver's environment — so the run id has to be applied
+  # driver-side, after the fact, not in this file.
   JAATO_PROVIDER_TRACE: "/tmp/mono-trace-subconscient.log"
   MONOLOGUE_INTERVAL_SECONDS: "5.0"
   MONOLOGUE_THOUGHT_CEILING: "1000"

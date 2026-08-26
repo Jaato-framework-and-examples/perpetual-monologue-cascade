@@ -60,6 +60,9 @@ def _load_env_file(path):
 
 _load_env_file(ENV_FILE)
 
+#: Identifies this run's archived artifacts.
+_run_id = time.strftime("%H%M%S")
+
 #: Short on purpose: AF_UNIX caps a socket path at 108 bytes and fails
 #: opaquely past it.
 SOCKET = os.environ.get("JAATO_IPC_SOCKET", "/tmp/monologue.sock")
@@ -134,9 +137,17 @@ def render(ev):
         # log said the save had failed. A stale transcript read afterwards
         # is evidence about nothing, which cost a whole run's worth of
         # conclusions.
-        sid = getattr(ev, "session_id", None)
-        if sid and sid not in _pending_saves:
-            _pending_saves.append(sid)
+        # DISABLED for the loop-pressure test. `session.save` fetches the
+        # runner's history through the DAEMON LOOP, and run 21 attributed
+        # 5 of 7 loop stalls to `session_get_history` against 2 to
+        # `session_offer_message` — so the saves are the dominant load and
+        # the deliveries are collateral. Turning them off separates my
+        # instrumentation from the framework's loop: if the stalls vanish,
+        # the contention was mine.
+        if os.environ.get("MONOLOGUE_SAVE_PER_SEND") == "1":
+            sid = getattr(ev, "session_id", None)
+            if sid and sid not in _pending_saves:
+                _pending_saves.append(sid)
     elif kind == EventType.AGENT_STATUS_CHANGED and getattr(ev, "status", "") == "done":
         _flush(who)
 
@@ -240,10 +251,23 @@ async def main():
     # Several runs' worth of noise came from exactly that. A signal handler
     # that sets `shutdown` lets the `finally` unload both halves, which is
     # the difference between stopping a driver and stopping a mind.
+    # Setting the flag is NOT enough on its own: observe() parks on
+    # `async for ev in stream`, and a flag it never gets to re-check leaves
+    # the turn hanging before the unload block — a graceful stop that
+    # degrades into kill -9 and leaves sessions loaded, which is the ghost
+    # problem the flag was added to close. So the handler also CANCELS the
+    # observer task, which unblocks the iterator and lets the finally run.
     loop = asyncio.get_running_loop()
+    tasks: list = []
+
+    def _stop():
+        shutdown.set()
+        for t in tasks:
+            t.cancel()
+
     for sig in (signal.SIGTERM, signal.SIGINT):
         with contextlib.suppress(NotImplementedError):
-            loop.add_signal_handler(sig, shutdown.set)
+            loop.add_signal_handler(sig, _stop)
 
     async def on_failed_send(ev):
         # The receipt STATUS is not on the event — only the prose the
@@ -402,7 +426,9 @@ async def main():
         "thought leading to the next.")
 
     try:
-        await asyncio.gather(observe(), watchdog())
+        tasks.extend((asyncio.create_task(observe()),
+                      asyncio.create_task(watchdog())))
+        await asyncio.gather(*tasks, return_exceptions=True)
     except KeyboardInterrupt:
         print(f"\n[{_stamp()}] interrupted", flush=True)
     finally:
@@ -420,6 +446,16 @@ async def main():
         # session the client LEAVES. So attach to the subconscient, then
         # back to the conscient — that saves the subconscient — and let
         # disconnect save the conscient on the way out.
+        # ARCHIVE THE TRACES BEFORE THE NEXT RUN CAN OVERWRITE THEM.
+        # A fixed trace path plus `rm` before each run destroyed run 21's
+        # fourteen-stall sample — the one that would have answered whether
+        # the daemon-loop stall tracks output volume. Optimising for a clean
+        # read instead of a comparable one.
+        for _h in ("conscient", "subconscient"):
+            with contextlib.suppress(Exception):
+                src = f"/tmp/mono-trace-{_h}.log"
+                if os.path.isfile(src):
+                    os.replace(src, f"/tmp/mono-trace-{_h}-{_run_id}.log")
         print(f"[{_stamp()}] unloading both halves (saving transcripts)",
               flush=True)
         with contextlib.suppress(Exception):
