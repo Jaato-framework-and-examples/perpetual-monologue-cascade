@@ -36,6 +36,31 @@ plugin_configs:
         tools: [store_memory, retrieve_memories, list_memory_tags,
                 update_memory, delete_memory]
 
+env:
+  # The curator had no env block at all, so it was the one session whose
+  # TOOL CALLS were invisible. That cost a real answer on run 30: three
+  # memories moved raw->curated carrying `maturity: "raw"`, and whether the
+  # curator asked for that or the routing did it unasked could not be
+  # settled from the outcome alone. An instrument that covers two of three
+  # sessions reports the third as silent, and silence is not a reading.
+  #
+  # TWO VARIABLES, because they answer different questions and I reached
+  # for the wrong one first. JAATO_PROVIDER_TRACE carries budget and token
+  # accounting; it does NOT carry tool-call arguments, so it cannot say what
+  # the curator asked for. The memory plugin's own `self._trace` — including
+  # `update_memory: id=..., maturity=...` — goes to JAATO_TRACE_LOG
+  # (jaato_sdk/trace.py:29). That one is the instrument for this question.
+  #
+  # Same fixed-path convention as the halves: the DRIVER archives both per
+  # run, because a ${VAR} here is expanded by the DAEMON, which never sees
+  # the driver's environment.
+  #
+  # No MONOLOGUE_INTERVAL_SECONDS: this profile registers no permission
+  # `evaluators`, so the pacer never runs here and would have nothing to
+  # read. The halves need it; the curator does not.
+  JAATO_PROVIDER_TRACE: "/tmp/mono-trace-curator.log"
+  JAATO_TRACE_LOG: "/tmp/mono-plugin-curator.log"
+
 # NO budget_control — §7.4, certified as C3. The cascade ceiling covers all
 # three sessions or it covers none of them.
 suppress_base_instructions: false
