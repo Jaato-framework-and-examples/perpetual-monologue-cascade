@@ -2,37 +2,51 @@
 
 The design is in [README.md](README.md). This is the operational half.
 
-**Nothing here has been run end to end.** Two framework facts underneath it
-are certified on jaato `4138a9a5` (README §4.1, §11 Q2); the shutdown path
-is read from source and never observed (§7.15). Expect to debug.
+**It runs.** Both halves think, send, and take each other's thoughts up as
+material; the curator wakes on a store and reports. What it does not yet do
+is run for long — a framework defect kills one half about three minutes in,
+every time. That is the whole of the current gap, and it is not in this
+repo. Read the next section before your first run.
 
-## It does not run yet — and the reason is not in this repo
+Current readings are from jaato `891602f9` (#619 through #627 merged).
 
-**Do not expect a working loop.** It completes exactly one round trip and
-then strands, on every framework version tested including `e5ef1003` (#617)
-and `8d89ffc1` (#618).
+## The one thing that will happen to you
 
-The cause, root-caused jointly with the framework owner over runs 8-11: a
-message delivered to an IDLE session is queued and never drained, because
-`inject_prompt` only starts a turn while a `send_message` RPC is in flight.
-The recovery path is the same channel, so the driver's watchdog nudge lands
-in the same dead queue — measured, the queue grows 1 → 2 → 3 and is never
-popped. See README §7.14.
+**A half dies ~3 minutes in, and the loop goes quiet without erroring.**
+Reproduced on runs 26 and 27, on two different daemon builds:
 
-PR #619 fixes the half that made this UNRECOVERABLE — a nudge to an idle
-session will drive a turn, and `inject_prompt` returns a status instead of
-silence. It does NOT fix the sibling strand; that is a second change, moving
-the busy/idle decision to the runner. So after #619 expect a loop that still
-stops after one round trip, but a session you can still reach. Until it lands, this
-workspace is useful as a BENCH rather than as a running monologue: the
-pacer interval is one line in one profile, and widening it turns a
-turn-boundary race from something a request/response cascade dismisses as a
-flake into something that reproduces 5/5.
+```
+MODEL_THREAD_TERMINAL_ERROR error_type=TimeoutError
+error=daemon loop did not deliver
+      RunnerRPCClient.session_get_context_usage within 10.0s
+      (daemon-side: the coroutine was scheduled onto the loop
+       and did not complete)
+→ SessionTerminatedEvent(reason=error)
+→ _apply_default_cascade_policy: triggered unload
+```
+
+The daemon loop stops running scheduled coroutines for 5-35s. That alone is
+survivable. What makes it fatal is that the model thread catches it with a
+bare `except Exception` and classifies nothing, so "the event loop was busy
+for ten seconds" takes the same branch as a revoked API key: terminal, and
+the session is unloaded. It is then **cold**, and a cold sibling is not
+woken by a sibling message — so the surviving half spends the rest of the
+run sending into a corpse and collecting `sibling_cold`.
+
+The driver prints `!! a half went cold` and says this is not expected in a
+running loop. That message predates this finding and is now half wrong:
+README §7.2 and §11 Q2 both say cold is reached only by a driver attaching
+away. **That is no longer the only way.** A stall that lands on the wrong
+coroutine reaches it too.
+
+Reported with jaato-30; it is their highest-severity open item. Until it
+lands, expect roughly three good minutes per run — which is enough to read
+persona behaviour and not enough to exercise continuity.
 
 ## What you need
 
-- A jaato daemon on `$JAATO_IPC_SOCKET` (default `/tmp/monologue.sock`).
-  Keep the path short — AF_UNIX caps it at 108 bytes and fails opaquely.
+- A jaato daemon on `$JAATO_IPC_SOCKET`. Keep the path short — AF_UNIX caps
+  it at 108 bytes and fails opaquely.
 - An OpenRouter key.
 
 ```bash
@@ -40,39 +54,66 @@ cp .env.example .env      # then put your key in it
 python3 monologue.py      # the driver: opens, observes, nudges, reaps
 ```
 
-Two optional companions, in other terminals:
+The daemon is **not** a singleton, whatever `.env.example` says next to
+`JAATO_IPC_SOCKET`. Several can coexist as long as each gets its own
+`--ipc-socket`, `--pid-file` and `--log-file`; without a distinct pid file
+the second refuses to start with "already running". Check who owns a socket
+with `ss -lxp | grep <socket>` rather than trusting a pid file. Restart a
+daemon only to pick up new framework commits — never between runs, since a
+cold spawn costs ~30s against ~7s warm.
+
+Four companions, in other terminals:
 
 ```bash
-python3 observe.py                        # read both halves, touch nothing
+python3 observe.py                        # read all three, touch nothing
 echo "what about the retry loop?" | python3 whisper.py
 python3 whisper.py --urgent "stop and answer me"
+python3 unload.py <session_id>            # save one transcript, daemon stays up
+python3 analyze_run.py                    # what one run's artifacts can answer
 ```
 
 `whisper` offers a thought the mind may ignore; `--urgent` interrupts and
 expects an answer. That difference is an authority tier the framework
 enforces, not a wording choice — README §8.1.
 
+`unload` is how you get a transcript. **Never `delete_session`** — it
+destroys the transcript rather than saving it. The driver unloads by
+attaching away on shutdown for the same reason.
+
 ## The knobs that matter
 
 | Where | Knob | Why you would touch it |
 |---|---|---|
-| `monologue.py` | `LIMITS` | **The ceiling. Read this before your first run.** `{"usd": 5.00}` is the whole safety mechanism; the pacer is an optimiser and fails open (§7.7). |
-| `.jaato/profiles/_base_*.yaml` | `MONOLOGUE_INTERVAL_SECONDS` | 30s deliberate / 8s associative. §11 Q4 records that this asymmetry is a guess and may be backwards. |
+| `.env` | `MONOLOGUE_CEILING_USD` / `_TURNS` | **The ceiling. Read this before your first run.** Shipped `2.00` / `200`. There is no default in code — the driver exits if either is unset, because guessing it would be guessing how much money you are willing to lose. The pacer is an optimiser and fails open (§7.7). |
+| `.jaato/profiles/_base_*.yaml` | `MONOLOGUE_INTERVAL_SECONDS` | `5.0` on both halves. Was 30/8 on a guess that the halves should be paced asymmetrically; §11 Q4 is now answered and that guess was wrong — see below. |
+| `.jaato/profiles/_base_*.yaml` | `MONOLOGUE_THOUGHT_CEILING` | `1000`. Surfaces in the send receipt as `thought N/1000`, and the mind reasons about it — run 26 noticed the counter and concluded silence should be the default state. |
 | `.jaato/profiles/_base_*.yaml` | `suppress_base_instructions` | **The biggest lever on burn rate.** See below. |
 | `.jaato/profiles/openrouter_mixed/*.yaml` | `model` | Per-half binding; the base profiles stay provider-agnostic. |
-| `monologue.py` | `STALL_AFTER` | 180s. Below ~90s it will nudge a healthy paced loop. |
+| `monologue.py` | `STALL_AFTER` | 180s. Below ~90s it will nudge a healthy paced loop. The watchdog resets on thoughts only — output text or a send — not on any event, or a busy-but-silent session looks alive. |
+| env | `MONOLOGUE_SAVE_PER_SEND=1` | Per-send `session.save`, **off by default**. It fetches history through the daemon loop, and run 21 attributed 5 of 7 stalls to `session_get_history`. Leaving it off separates our contention from the framework's. |
+
+### The pacer interval is not the phase offset
+
+Both halves are paced identically at 5s because the asymmetry the old
+30s/8s split was reaching for does not exist. The one-thought offset
+between the halves is **tier-structural**: `SIBLING` is an `IDLE_ONLY`
+source, drained at a turn boundary and nowhere else, so a sibling's thought
+can never land mid-turn however the pacer is set. Widening the interval
+does not change the offset; it only makes it easier to see.
 
 ### suppress_base_instructions — the one real trade
 
-Shipped as `false`. The coordination example measured ~24,000 tokens of
-base instructions per session — 81% of one turn's context — and suppressing
-them is what made its cascade budget measurable rather than guessed.
+Shipped as `false` on all three profiles.
+
+The coordination example measured ~24,000 tokens of base instructions per
+session — 81% of one turn's context — and suppressing them is what made its
+cascade budget measurable rather than guessed.
 
 It is left on anyway, because README §6's security property (a sibling
 proposes, it cannot command) depends on the model honouring the
-`⟦UNTRUSTED-EXTERNAL-CONTENT⟧` boundary its inbound sibling messages are
-wrapped in, and the base instructions are where that boundary is explained.
-Their `_base_sibling-a.yaml` keeps it on for exactly this reason.
+`⟦UNTRUSTED-EXTERNAL-CONTENT⟧` boundary its inbound messages are wrapped
+in, and the base instructions are where that boundary is explained. The
+curator's wake arrives inside the same wrapper, so this covers it too.
 
 Flipping it to `true` roughly quarters your burn rate and weakens §6 to
 whatever the model does with an unexplained marker. That is a real choice
@@ -81,45 +122,96 @@ without deciding.
 
 ## Model bindings
 
-| Half | Model | Provenance |
-|---|---|---|
-| subconscient | `anthropic/claude-haiku-4.5` | proven on OpenRouter by the coordination example |
-| conscient | `anthropic/claude-sonnet-5` | **inferred.** Current per the model table; the exact OpenRouter slug is unverified against their catalogue. One line in one file if it 404s. |
+| Half | Model | Temp | Provenance |
+|---|---|---|---|
+| conscient | `anthropic/claude-sonnet-5` | 0.8 | verified — runs 22-27 |
+| subconscient | `anthropic/claude-haiku-4.5` | 1.0 | proven on OpenRouter by the coordination example |
+| curator | `anthropic/claude-sonnet-5` | 0.3 | judgement about what deserves to persist; the one place here that wants consistency |
 
 ## Temperature is deliberately not zero
 
 Every other cascade in this org pins `temperature: 0.0` for byte-identical
 output. Here that is the failure mode — a thought process that returns the
 same thought forever is §7.9, "a stuck volley is invisible". The monologue
-is the one workload that wants variance, and it is the one place this
-repo parts company with the determinism budget.
+is the one workload that wants variance, and it is the one place this repo
+parts company with the determinism budget.
+
+The curator is the exception to the exception, at 0.3.
+
+## Reading a run
+
+Traces are archived per run, because a fixed path plus `rm` before each run
+destroyed run 21's fourteen-stall sample:
+
+```
+/tmp/mono-trace-<half>-<HHMMSS>.log     # per-half provider trace
+/tmp/monoC.log                          # daemon log — where the stalls are
+```
+
+Greps that pay for themselves:
+
+```bash
+grep MODEL_THREAD_TERMINAL_ERROR /tmp/monoC.log   # did a half get killed
+grep "CONTINUATION: Processing"  /tmp/monoC.log   # N>1 means a lost-stash repro
+grep SIBLING_DELIVERY            /tmp/monoC.log   # outcome= and replica_busy=
+```
+
+**A zero from any of these is only a null if the daemon was started after
+the commit that emits the line.** `CONTINUATION: Processing` landed in
+#627; a daemon older than that produces a zero which means nothing at all.
+Check `ps -o lstart=` on the daemon pid before believing an absence. This
+has already cost one false negative.
 
 ## What is not implemented
 
-- **Continuity across restarts (README §9).** `{{continuity_scope}}` has
-  zero occurrences in the framework and the checkout carries no `docs/`
-  tree, so the mechanism §9 describes could not be verified, let alone
-  wired. Both halves load the `memory` plugin, so they can store — but
-  nothing drains raw→curated, and enrichment surfaces curated memories
-  only. **The mind wakes with amnesia every run.** Fixing it needs the
-  curator §9 calls non-optional.
+- **Continuity across restarts (README §9).** All three sessions load the
+  `memory` plugin and the halves do store — 12 raw memories sit in
+  `.jaato/memories/raw/` — but **nothing has ever been curated**, so
+  enrichment (curated-only) surfaces nothing and the mind wakes with
+  amnesia every run. The curator itself is wired and fires correctly; it is
+  blocked on a framework regression, below.
 - **Stuck-volley detection (§7.9, §11 Q1).** Nothing notices two halves
   circling one thought. Every event looks healthy while it happens.
-- **Reviving a cold half.** `session.wake` is the mechanism (§11 Q2) and
-  the driver does not call it — cold is not reachable by resting, so it
-  would be code for a case that should not occur. `render_cold` says so
-  loudly if it ever does.
+- **A long run.** Nothing here has run more than ~6 minutes, because of the
+  session kill above. Everything about behaviour over hours is unknown.
+
+### The curator is blocked upstream, not here
+
+The driver wakes the curator on every successful `store_memory` (via
+`session.wake`, which takes an explicit session_id and revives a cold
+target — so the curator being unloaded between curations is harmless). The
+chain fires. The curator then reports an empty store.
+
+It is not wrong to. `MemoryStore.search_by_maturity` — documented
+"Curator-facing maturity query", correct, unit-tested — has **zero
+production callers**: `_execute_retrieve` routes every non-`ids` query
+through `search_by_tags`, which reads `curated.jsonl` only. So
+`retrieve_memories(maturity="raw")` cannot reach the raw queue, though the
+shipped `memory-advisor` persona, the plugin's own class docstring, and the
+tool schema all say it can. Regression origin: `3f019999`, which split the
+raw queue from the curated store and never repointed the handler.
+
+Worse for debugging: `list_memory_tags` computes `count_by_maturity()` on
+every call, which *does* count the raw queue, then returns `memory_count`
+from the curated-built indexer and routes the true `count_raw` into
+`_telemetry`. It answers "Found 0 memories" while holding "raw: 12" in the
+same dict. Both curator sessions reasoned correctly from that false
+premise; one hedged that "the memory write hasn't landed yet".
+
+Reported to jaato-30. The minimal fix is one branch in `_execute_retrieve`.
+Nothing in this repo needs to change when it lands.
 
 ## First-run checklist
 
-1. Set `LIMITS` to something you are willing to lose.
-2. Watch the first three volleys in the driver's own output — you should
-   see alternating `→ send_to_sibling` lines about 30s apart.
-3. If the first send returns `✗`, read the error: `sibling_cold` means
-   something attached away from a half (§11 Q2); a permission block means
-   the whitelist did not apply, and the most likely cause is
-   `defaultPolicy` sitting flat under `permission:` instead of nested
-   under `policy:`.
-4. If nothing appears at all, the loop never started: the kickoff message
+1. Set the ceiling in `.env` to something you are willing to lose.
+2. Watch the first volleys in the driver's own output — alternating
+   `→ send_to_sibling` lines roughly 5s apart.
+3. If a send returns `✗ sibling_cold` a few minutes in, that is the
+   framework kill, not your configuration. Confirm with
+   `grep MODEL_THREAD_TERMINAL_ERROR /tmp/monoC.log`.
+4. If the first send returns `✗` with a permission block, the whitelist did
+   not apply, and the most likely cause is `defaultPolicy` sitting flat
+   under `permission:` instead of nested under `policy:`.
+5. If nothing appears at all, the loop never started: the kickoff message
    goes to whichever session the driver is attached to, and that is the
    conscient by construction.
