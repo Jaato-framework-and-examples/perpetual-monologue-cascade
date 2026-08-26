@@ -229,37 +229,64 @@ def _side_by_side(docs: List[dict]) -> List[str]:
     # looks exactly like a real one — so refuse it and say why.
     lanch = sum(1 for st in lsteps if st["exact"])
     ranch = sum(1 for st in rsteps if st["exact"])
-    if not lanch or not ranch:
-        blind = lname if not lanch else rname
-        return ["## Side by side", "",
-                f"**Not rendered for this cascade.** `{blind}` has no step "
-                "with a recoverable timestamp, so its column cannot be "
-                "placed against the other half — and a merge done anyway "
-                "would read as a chronology rather than as a guess.", "",
-                "The times come from `turn_accounting`, which is written on "
-                "save; a session saved mid-turn carries fewer records than "
-                "its history has calls, and one whose history was trimmed "
-                "carries more. Only the region where the two agree is used. "
-                f"Here that region is empty for `{blind}` "
-                f"({lname}: {lanch}/{len(lsteps)} steps anchored, "
-                f"{rname}: {ranch}/{len(rsteps)}).", "",
-                "The per-session sections below are unaffected — they are "
-                "sequential and need no clock.", ""]
+
+    # A COLUMN WITH NO ANCHOR AT ALL STILL GETS RENDERED — but by SEQUENCE,
+    # and labelled as such.
+    #
+    # Inheriting a time works WITHIN a session, where an unanchored step
+    # sits between two known neighbours.  It does not work when a session
+    # has no anchored step anywhere: there is nothing to inherit, every row
+    # lands on the empty string, and the column sorts to the top as though
+    # that half thought everything before the other half began.  That is a
+    # fabricated chronology that reads exactly like a real one.
+    #
+    # Refusing outright was the first fix and it was too blunt — an
+    # incomplete view beats no view.  So such a column is SPREAD across the
+    # other half's measured span in its own order, its time cell shows a
+    # dash rather than a number, and the header says it is placed by
+    # sequence.  The order within it is real; the position against the
+    # other column is not, and nothing in the output implies otherwise.
+    def _spread(steps: List[dict], anchors: List[str]) -> None:
+        if not anchors or len(steps) < 1:
+            return
+        lo, hi = anchors[0], anchors[-1]
+        for n, st in enumerate(steps):
+            st["ts"] = lo if len(steps) == 1 else (
+                lo if n * 2 < len(steps) else hi)
+            st["placed"] = True
+
+    lts = sorted(st["ts"] for st in lsteps if st["exact"])
+    rts = sorted(st["ts"] for st in rsteps if st["exact"])
+    if not lanch and rts:
+        _spread(lsteps, rts)
+    if not ranch and lts:
+        _spread(rsteps, lts)
+
+    rows = ([(st["ts"], st["exact"], 0, st) for st in lsteps]
+            + [(st["ts"], st["exact"], 1, st) for st in rsteps])
 
     rows.sort(key=lambda r: (r[0], r[2]))
+    def _cov(name, anch, steps):
+        if anch:
+            return f"`{name}` {anch}/{len(steps)} steps anchored"
+        return (f"`{name}` has NO recoverable timestamp — its {len(steps)} "
+                "steps are in their own true order but are placed against "
+                "the other column by sequence, not measured")
+
     out = ["## Side by side", "",
-           f"Both halves in real time, `{lname}` left and `{rname}` right. "
-           "Merged on per-step timestamps recovered from `turn_accounting` "
-           "by position, over the region where its call sequence still "
-           "agrees with history — "
-           f"`{lname}` {lanch}/{len(lsteps)} steps anchored, "
-           f"`{rname}` {ranch}/{len(rsteps)}. A time in *italics* was "
-           "inherited from the step before, because that step made no call "
-           "and history carries no clock of its own.", "",
+           f"Both halves, `{lname}` left and `{rname}` right. Times come "
+           "from `turn_accounting`, matched to history by position over the "
+           "region where the two call sequences still agree: "
+           f"{_cov(lname, lanch, lsteps)}; {_cov(rname, ranch, rsteps)}. "
+           "A time in *italics* was inherited from the step before, because "
+           "that step made no call and history carries no clock of its own; "
+           "a dash means the step could not be timed at all.", "",
            f"| time | `{lname}` | `{rname}` |", "|---|---|---|"]
     for ts, exact, side, step in rows:
-        when = ts[11:19] if ts else "?"
-        when = when if exact else f"*{when}*"
+        if step.get("placed") or not ts:
+            when = "—"
+        else:
+            when = ts[11:19] if exact else f"*{ts[11:19]}*"
         cell = _cell(step, (left if side == 0 else right).get("workspace_path"))
         out.append(f"| {when} | {cell} |  |" if side == 0
                    else f"| {when} |  | {cell} |")
