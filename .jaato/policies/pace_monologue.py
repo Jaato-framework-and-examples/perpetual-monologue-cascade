@@ -30,6 +30,7 @@ cascade ceiling is the actual backstop (README §7.7). Treat this as an
 optimiser.
 """
 import os
+import threading
 import time
 
 from shared.plugins.permission.evaluator import PolicyDecision, EvalResult
@@ -41,6 +42,19 @@ from shared.plugins.permission.evaluator import PolicyDecision, EvalResult
 _INTERVAL_VAR = "MONOLOGUE_INTERVAL_SECONDS"
 _CEILING_VAR = "MONOLOGUE_THOUGHT_CEILING"
 
+#: PARALLEL TOOL CALLS BREAK AN UNGUARDED GOVERNOR. The evaluator runs in
+#: the calling session's tool-worker thread and there are EIGHT of them, so
+#: a turn emitting several sends at once enters here concurrently. Without
+#: this lock all of them read the same stale `_last`, all compute wait <= 0,
+#: all skip the sleep, and the interval silently stops applying exactly when
+#: the mind thinks fastest — measured: six sends in 12 MILLISECONDS against a
+#: 5-second interval. `_count` raced the same way, so `thought N/1000`
+#: undercounted.
+#:
+#: §5.4 argued this was the right place for the throttle BECAUSE it runs in
+#: the calling session's tool-worker thread. That argument is sound and I
+#: wrote it without noticing the sentence says "thread", not "the thread".
+_lock = threading.Lock()
 _last = 0.0
 _count = 0
 
@@ -64,6 +78,15 @@ def _misconfigured(detail):
 
 
 def evaluate(tool_name, args, context):
+    global _last, _count
+    # The whole check-sleep-update is one critical section: serialising the
+    # sends IS the throttle, so releasing early would let the next caller
+    # through while this one sleeps.
+    with _lock:
+        return _evaluate_locked(tool_name, args, context)
+
+
+def _evaluate_locked(tool_name, args, context):
     global _last, _count
 
     raw_interval = os.environ.get(_INTERVAL_VAR)
