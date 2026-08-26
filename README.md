@@ -787,9 +787,10 @@ forge (`permission/channels.py:1300`; certified as C2).
 | 7.11 | **Whisper starvation** | An idle-only stamp drains only when the session is idle, and a hot volley leaves little idle time. | Accepted rather than fixed: freedom to ignore implies no timeliness guarantee. Escalate to `speak` (`user`, high priority) when it actually matters. |
 | 7.12 | **A failed send still satisfies the invariant** | The persona rule is "never end a turn without *calling* `send_to_sibling`" — but a call is not a delivery. `refused`, `sibling_cold` and `no_such_sibling` all return `(False, receipt)`, a hard tool error that delivered nothing (`plugin.py:1117`), and nothing then wakes the peer. `refused` is the least expected of the three: `SIBLING_PENDING_CAP = 20` consecutive `queued` sends to a peer that never came up for air (`session_manager.py:360,5304`). | Driver-side branch on `ToolCallEndEvent(tool_name="send_to_sibling", success=False)` (§5.6) — driver-side and **not** in the persona, for the reasons in §5.2. **Partial.** The event carries the receipt's prose, not its `status`, so the driver matches on a sentence. And `refused` is *backpressure, not a fault* — the caps are "in front of that ceiling, not a replacement for it" (`session_manager.py:353`) and the refusal literally says "Let it work" — so it is deliberately not treated as an error. The counter also resets on any delivery finding the peer idle, which makes a strictly alternating pair near-immune and a third sibling (§11 Q6) not. |
 | 7.13 | **The ceiling leaks the cascade** | A budget refusal terminates nothing (§5.6). With `observe()` and `watchdog()` both looping forever, `gather` never returns, the `finally` that reaps both sessions is unreachable, and §8.4's attachment pins the conscient in memory indefinitely. The watchdog then live-locks: nudge at `STALL_AFTER` → the exhausted session refuses → the refusal emits an event → `last_activity` resets → nudge again, forever, in a process that can no longer do anything. | A `shutdown` event set from `SessionTerminatedEvent(reason="budget_exhausted")`, a watchdog that awaits it instead of sleeping blind, and `aclosing()` on the iterator (§5.6). |
-| 7.14 | **A message delivered to a session with no drainer is stranded forever** | **The one that actually kills this design, observed twice and confirmed by the framework owner as a real bug (fixed in PR #617).** Two faces, one cause. (a) `send_to_sibling` to a peer the daemon still considers busy takes the QUEUE branch — but `_drain_child_messages` was the last statement of `_run_chat_loop`, and daemon-side `_model_running` clears five steps later, so a send landing in that window queued onto a tier whose drainer had already gone past and whose continuation callback was already torn down. Nothing could ever pop it. (b) `inject_prompt` starts a turn only while `_on_continuation_needed` is installed — for the DURATION of a `send_message` RPC, not whenever a session is idle — so the §7.2 watchdog nudge was a **no-op**. Both watchdog firings in run 7 did nothing. | **Framework fix, not a workaround.** #617 loops the drain until the queue is empty and lets that re-check end the turn, so a late message is either drained or arrives after the busy flag clears (and the sender then DRIVES, per #612); exactly one continuation fires per batch, because firing per pass would turn one stranded message into duplicate turns — worse for a loop with no driver. `inject_prompt_to_session` now drives an idle target, fixed in the shared primitive because reactor rules and webhook handlers had the same hole. **This design does not work on a framework older than #617.** |
+| 7.14 | **An idle session is UNREACHABLE, and the unreachability is self-sealing** | **The bug that defeats this design. Reproduced 5/5, root-caused with the framework owner.** `JaatoSession.inject_prompt` starts a turn only when `_activity_phase == IDLE` AND `not _is_running` AND `_on_continuation_needed` is installed — and that callback exists only for the duration of a `session.send_message` RPC (`jaato_session.py:1400`). So on a genuinely idle session it always queues, and nothing drains that queue: the only drainers are mid-turn yield points and the end-of-turn drain, both of which need a turn that is not happening. Worse, the SDK's `client.inject_prompt` reaches the runner through a handler that never calls `deliver()` and makes NO busy/idle decision at all (`session_manager.py:9868`) — so it cannot start a turn under any circumstances, on any session, in any state. | **None available to this design.** The driver's whole recovery mechanism — nudge on silence — cannot work BY CONSTRUCTION, because the nudge lands in the same dead queue as the message it was sent to rescue. Measured: the conscient's queue grows 1 → 2 → 3 (one sibling message, then both watchdog nudges) and is never popped. A stranded session is not stalled, it is unreachable, and the recovery channel is the broken one. **PR #619 fixes the RECOVERY half**: `InjectPromptRequest` now routes through the queue-or-drive decision instead of forwarding blind, so a nudge to an idle session drives a turn and `inject_prompt` returns a real status (`accepted`/`queued`/`terminated`/`no_session`/`unreachable`) rather than silence. **It does not fix the sibling strand.** And the cause is NOT where an earlier version of this row put it: the drain's placement is correct. The runner marks itself not-running (`jaato_session.py:5801`), sets `IDLE` (`:5804`), and only THEN drains (`:5844`, the last statement) — the intended "drain anything queued before going idle" is implemented. It cannot help, because the message arrives after that point. Run 12: the conscient drained at 08:59:11 with `queue_at_entry=0` and the reply arrived at 08:59:41, thirty seconds after that turn was over. **The defect is that the sender was told `busy=True` about a session that had been idle for half a minute** — the daemon decides queue-or-drive from `JaatoServer._model_running`, a DIFFERENT OBJECT from the runner's `_is_running`, on the far side of the RPC, and its copy cannot clear until the `send_message` RPC unwinds. Idle would have meant DRIVEN (#612) and the loop would never have stalled. So no amount of draining fixes this: a message arriving after the last drain needs to START a turn, and it was denied that on a stale flag. The fix is to move the busy/idle decision to the runner, which owns the authoritative one.<br><br>**Measured on `d5b6d716`: the strand becomes TRANSIENT — but read the precondition.** A stranded message is collected by the end-of-turn drain of ANY subsequent turn (#617's loop), so it is delayed rather than lost — 3.5 minutes in run 12. Recovery does not come from the strand healing itself; **it comes from something starting a NEXT TURN.** #619 did not make the strand recoverable, it made the RECOVERER work, and the recoverer was already there. So: *a strand is terminal when nothing can start a turn, and transient when something can.* This design's watchdog is that something. **A pure symmetric pair with no driver and no nudge still has nothing to start the next turn, so for that topology the strand remains TERMINAL** — it merely stops looking terminal in any bench that has a watchdog. Do not carry "self-healing" without this sentence attached. |
+| 7.15 | **`#617` and `#618` do NOT fix this** | Recorded because an earlier version of this row said they did. #617 loops the end-of-turn drain and #618 adds `SIBLING_DELIVERY` / `DRAIN_SUMMARY` diagnostics; both are real and both were necessary to find the cause. Neither reaches §7.14, because looping a drain does not help a message that arrives after the last turn-end, and a diagnostic does not fix what it reveals. Certified on `e5ef1003` and `8d89ffc1`: strands on both. #619 fixes half — the session stops being unreachable, the sibling strand remains. | Do not read a merged fix as a fixed bug without a run that says so. This design does not work on ANY current framework version. |
 | 7.15 | **A live session's transcript cannot be read** | A `send_to_sibling` receipt is readable in exactly one place — the sending session's saved history. No cascade event carries the body, and `ToolCallEndEvent.success` is True for both `accepted` and `queued`, so the driver cannot tell them apart live. History is written on SAVE, and a session under diagnosis has not saved. Forcing it by attaching away is a side effect standing in for an interface, and a silent no-op when the client is attached elsewhere — which is what happened here: the subconscient's file stayed pinned at the instant it sent, so its receipt was never obtainable. | `session.save [id]` shipped in #617; `SessionManager.save_session` had always existed with nothing exposing it. Until then the receipt is only the model's word for it. |
-| 7.16 | **A refused spawn is silent, and silence looks like work** | `cascade_budget_set` runs before the sessions are created, so a cid with no headroom refuses the spawn — correctly — but the refusal is logged daemon-side and is invisible to the client, indistinguishable from a slow turn. The coordination example's driver hung fifteen minutes on it. | Call `cascade_budget_get` before drawing any conclusion from silence. Reported from their run; not hit here. |
+| 7.17 | **A refused spawn is silent, and silence looks like work** | `cascade_budget_set` runs before the sessions are created, so a cid with no headroom refuses the spawn — correctly — but the refusal is logged daemon-side and is invisible to the client, indistinguishable from a slow turn. The coordination example's driver hung fifteen minutes on it. | Call `cascade_budget_get` before drawing any conclusion from silence. Reported from their run; not hit here. |
 
 ---
 
@@ -1011,13 +1012,68 @@ run an advisor on a schedule, or the mind wakes with amnesia every time.
    summarises the middle. For a monologue, the *middle* is the biography. The
    memory plugin is the durable channel, but that requires the personas to
    actively store — which is a third invariant nobody enforces.
-4. **Is asymmetric pacing right?** Slowing the deliberate half more than the
-   associative one is an aesthetic guess. It may be exactly backwards.
+4. **~~Is asymmetric pacing right?~~ — ANSWERED, and it was the wrong knob.**
+   This asked whether slowing the deliberate half more than the associative
+   one was backwards. Measured on `d5b6d716` (run 12, 10 sends): the halves
+   run **one thought out of phase**, each answering the message that arrived
+   during the other's *previous* turn — and the pacer is not the cause.
+
+   `SIBLING` is an `IDLE_ONLY` tier, and the idle-only drain has exactly ONE
+   call site: `jaato_session.py:5844`, the last statement of the chat loop.
+   So a sibling message that lands mid-turn is not collected until that turn
+   ends, and in a symmetric pair each half is therefore always answering the
+   other's previous thought. **By construction, not by latency** — the
+   distinction matters, because latency implies it will resolve and
+   construction says it will not. Queue depth stayed pinned at 1 for the
+   whole run (5 drains, all `Processed 1`, zero merged batches), which is
+   what lockstep looks like.
+
+   Nobody chose this. "A sibling must not interrupt work in progress" and
+   "a sibling is always answered one thought late" are the same property,
+   and only the first was intended; the second came free. Reached three
+   independent ways: from the tier semantics alone, from the run timeline,
+   and from the single drain site.
+
+   Equalising the intervals would change the halves' SPEED and leave the
+   PHASE untouched, so the experiment this question implies is not worth
+   running.
+
+   > **The shortcut here is a trap, recorded so nobody re-derives it.**
+   > `session.send` delivers on the `USER` tier, which is mid-turn, so a
+   > pair built on it would have no phase offset. It would also have no §6:
+   > `send_to_sibling` wraps its payload in `wrap_untrusted_content` and
+   > stamps `SIBLING`, while `session.send` sends the text RAW and stamps
+   > `source_id="operator"`, `source_type=USER`. So each half would address
+   > the other **as the human**, on the tier whose whole point is that the
+   > operator may interrupt. That is not a missing boundary, it is an active
+   > misattribution of authority. Useful as an instrument for measuring the
+   > tier's effect; never available as a fix.
 5. **Does a whisper ever land?** §7.11 is accepted in principle, but nobody
    has measured how much idle time a hot volley actually leaves. If the answer
    is "effectively none", the whisper channel is decorative and the design
    needs an explicit yield in the persona — end a turn, pause, then send —
    which is a different loop shape than the one described here.
+7. **Why is a runner silent for ~30 seconds after its chat loop ends?**
+   OPEN, and deliberately not filed as answered. Measured in runs 11 and 12:
+   the runner's drain completes, then BOTH the daemon log and the runner log
+   are empty for ~30s — no post-turn hooks, no history sync, no persistence —
+   and `context.updated` / `agent.status_changed` / `Saved session` all fire
+   within ~45ms at the far end, immediately after an inbound RPC lands.
+   Meanwhile `_model_running` stays True throughout.
+
+   This started as the suspected cause of §7.14 and stopped being
+   load-bearing once the flag's locality turned out to be the bug. Dropping
+   it there would be a mistake: **if a runner really is blocked for ~30s
+   after every turn, that is an independent latency defect affecting every
+   session in every cascade**, invisible in ordinary use precisely because
+   nothing watches an idle session. Step 2 makes the tail's WIDTH irrelevant
+   to correctness; it does not explain the width.
+
+   The measurement that would settle it needs nothing sent into the tail at
+   all — just timestamps from chat-loop-end to hook-fire on an otherwise
+   quiet run. This workspace is well placed to take it. Neither this repo
+   nor the framework side has filed it as resolved.
+
 6. **Two halves, or more?** A third sibling (a censor? an observer that only
    writes memories?) costs one more session and no new machinery. Unclear
    whether it adds signal or noise.

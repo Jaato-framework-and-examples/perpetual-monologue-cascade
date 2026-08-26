@@ -6,28 +6,28 @@ The design is in [README.md](README.md). This is the operational half.
 are certified on jaato `4138a9a5` (README §4.1, §11 Q2); the shutdown path
 is read from source and never observed (§7.15). Expect to debug.
 
-## Requires framework PR #617
+## It does not run yet — and the reason is not in this repo
 
-**This does not work on anything older.** Two framework bugs, found by the
-first two runs here and confirmed by the framework owner, made the loop
-strand after exactly one round trip:
+**Do not expect a working loop.** It completes exactly one round trip and
+then strands, on every framework version tested including `e5ef1003` (#617)
+and `8d89ffc1` (#618).
 
-- a sibling message delivered while the peer was still winding down its turn
-  queued onto a tier whose drainer had already passed — nothing could ever
-  pop it;
-- `inject_prompt` only starts a turn while a `send_message` RPC is in
-  flight, so the driver's watchdog nudge was a **no-op** and the documented
-  recovery path did nothing.
+The cause, root-caused jointly with the framework owner over runs 8-11: a
+message delivered to an IDLE session is queued and never drained, because
+`inject_prompt` only starts a turn while a `send_message` RPC is in flight.
+The recovery path is the same channel, so the driver's watchdog nudge lands
+in the same dead queue — measured, the queue grows 1 → 2 → 3 and is never
+popped. See README §7.14.
 
-#617 loops the drain until the queue is empty and makes
-`inject_prompt_to_session` drive an idle target. It also adds `session.save
-[id]`, without which a live session's transcript — and therefore any
-`send_to_sibling` receipt — cannot be read at all.
-
-Fixes to stranding are not fixes to boundedness: a symmetric pair with no
-completion schema still has only the cascade budget as a terminator. That is
-the design (§10, "the ceiling is the business model"), not an oversight, but
-do not read #617 as making the loop safe to leave running.
+PR #619 fixes the half that made this UNRECOVERABLE — a nudge to an idle
+session will drive a turn, and `inject_prompt` returns a status instead of
+silence. It does NOT fix the sibling strand; that is a second change, moving
+the busy/idle decision to the runner. So after #619 expect a loop that still
+stops after one round trip, but a session you can still reach. Until it lands, this
+workspace is useful as a BENCH rather than as a running monologue: the
+pacer interval is one line in one profile, and widening it turns a
+turn-boundary race from something a request/response cascade dismisses as a
+flake into something that reproduces 5/5.
 
 ## What you need
 

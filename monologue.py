@@ -223,8 +223,15 @@ async def main():
         elif "has not been idle since" in msg:
             render_backpressure(ev)     # peer alive and busy; "Let it work."
         else:
-            print(f"[{_stamp()}] !! unrecoverable: {msg}", flush=True)
-            shutdown.set()              # no_such_sibling
+            # NOT a shutdown. Run 12 died here on a MODEL error — the
+            # subconscient emitted send_to_sibling with no sibling_name —
+            # and this branch tore down a healthy nine-send loop over a
+            # malformed tool call the model would have retried. A failed
+            # send is the sender's problem to correct; the ceiling is the
+            # terminator, and silence is the watchdog's job. The driver
+            # does not get to end the mind over a typo.
+            print(f"[{_stamp()}] .. failed send (recoverable): {msg}",
+                  flush=True)
 
     async def observe():
         nonlocal last_activity
@@ -308,9 +315,25 @@ async def main():
                 # event that resets last_activity. Hence the shutdown gate
                 # above rather than a blind sleep (README §7.13).
                 print(f"[{_stamp()}] .. stream quiet, nudging", flush=True)
-                await client.inject_prompt(
+                # READ THE STATUS. Before #619 this returned nothing and the
+                # nudge was a black hole that said "ok" — the driver could
+                # not tell a delivered nudge from one that fell into a dead
+                # queue, which is why runs 8-11 showed silence and it was
+                # read as the framework's fault rather than as no answer.
+                #   accepted   a turn was started
+                #   queued     delivered, waiting on a turn that may not come
+                #   terminated the half is gone — stop nudging, say so
+                #   None       NOT TOLD (old daemon, or timeout). Not the
+                #              same as not delivered; do not report it as one.
+                status = await client.inject_prompt(
                     "The stream has gone quiet. Resume: send your next thought "
                     "onward now.", source_type="user")
+                print(f"[{_stamp()}] .. nudge -> {status!r}", flush=True)
+                if status == "terminated":
+                    print(f"[{_stamp()}] the conscient is terminated; "
+                          f"nudging cannot help. Stopping.", flush=True)
+                    shutdown.set()
+                    return
                 last_activity = time.monotonic()
 
     # The one outbound call into the loop. Everything after is observation.
