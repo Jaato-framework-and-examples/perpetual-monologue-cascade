@@ -126,6 +126,30 @@ def _steps(doc: dict) -> List[dict]:
     ta_calls = [c for row in doc.get("turn_accounting") or []
                 for c in (row.get("function_calls") or [])
                 if isinstance(c, dict)]
+    hist_calls = [p for m in doc.get("history") or []
+                  if m.get("role") == "model"
+                  for p in (m.get("parts") or []) if p.get("name")]
+
+    # THE ALIGNMENT MUST BE PROVEN PER SESSION, NOT ASSUMED.
+    #
+    # It held exactly on run 34 (24 against 24, 11 against 11) and I
+    # generalised from that without testing a second cascade.  Run 36 says
+    # otherwise: conscient 0 accounting records against 9 calls, curator 9
+    # against 18, and run 34's own curator 40 against 0.  `turn_accounting`
+    # is written on save, so a session saved mid-turn has less than its
+    # history — and a session whose history was trimmed has more.
+    #
+    # Unguarded positional indexing does not merely MISS a timestamp there;
+    # it silently attaches the WRONG one, which is worse than none because
+    # the reader cannot see it happen.  So: align only over the overlap,
+    # and only while the names still agree.  The first disagreement ends
+    # the anchored region for that session.
+    anchored = 0
+    for a, b in zip(ta_calls, hist_calls):
+        if a.get("name") != b.get("name"):
+            break
+        anchored += 1
+
     steps: List[dict] = []
     idx = 0
     last_ts = ""
@@ -139,7 +163,7 @@ def _steps(doc: dict) -> List[dict]:
                 prose.append(text)
             if part.get("name"):
                 when = ""
-                if idx < len(ta_calls):
+                if idx < anchored:
                     when = ta_calls[idx].get("start_time") or ""
                 idx += 1
                 if when and ts is None:
@@ -188,17 +212,50 @@ def _side_by_side(docs: List[dict]) -> List[str]:
     left, right = sibs[0], sibs[1]
     lname = left["sibling_name"]
     rname = right["sibling_name"]
-    rows = ([(st["ts"], st["exact"], 0, st) for st in _steps(left)]
-            + [(st["ts"], st["exact"], 1, st) for st in _steps(right)])
+    lsteps, rsteps = _steps(left), _steps(right)
+    rows = ([(st["ts"], st["exact"], 0, st) for st in lsteps]
+            + [(st["ts"], st["exact"], 1, st) for st in rsteps])
     if not rows:
         return []
+
+    # A COLUMN WITH NO ANCHOR CANNOT BE PLACED AGAINST THE OTHER.
+    #
+    # Inheriting a time works WITHIN a session, where the steps are already
+    # in order and an unanchored step sits between two known neighbours.
+    # It does not work when a session has no anchored step at all: there is
+    # nothing to inherit from, every row lands at the empty string, and the
+    # whole column sorts to the top as though that half thought everything
+    # before the other half began.  That is a fabricated chronology, and it
+    # looks exactly like a real one — so refuse it and say why.
+    lanch = sum(1 for st in lsteps if st["exact"])
+    ranch = sum(1 for st in rsteps if st["exact"])
+    if not lanch or not ranch:
+        blind = lname if not lanch else rname
+        return ["## Side by side", "",
+                f"**Not rendered for this cascade.** `{blind}` has no step "
+                "with a recoverable timestamp, so its column cannot be "
+                "placed against the other half — and a merge done anyway "
+                "would read as a chronology rather than as a guess.", "",
+                "The times come from `turn_accounting`, which is written on "
+                "save; a session saved mid-turn carries fewer records than "
+                "its history has calls, and one whose history was trimmed "
+                "carries more. Only the region where the two agree is used. "
+                f"Here that region is empty for `{blind}` "
+                f"({lname}: {lanch}/{len(lsteps)} steps anchored, "
+                f"{rname}: {ranch}/{len(rsteps)}).", "",
+                "The per-session sections below are unaffected — they are "
+                "sequential and need no clock.", ""]
+
     rows.sort(key=lambda r: (r[0], r[2]))
     out = ["## Side by side", "",
            f"Both halves in real time, `{lname}` left and `{rname}` right. "
-           "Merged on per-step timestamps recovered by position from "
-           "`turn_accounting`; a time in *italics* was inherited from the "
-           "step before because that step made no call and history carries "
-           "no clock of its own.", "",
+           "Merged on per-step timestamps recovered from `turn_accounting` "
+           "by position, over the region where its call sequence still "
+           "agrees with history — "
+           f"`{lname}` {lanch}/{len(lsteps)} steps anchored, "
+           f"`{rname}` {ranch}/{len(rsteps)}. A time in *italics* was "
+           "inherited from the step before, because that step made no call "
+           "and history carries no clock of its own.", "",
            f"| time | `{lname}` | `{rname}` |", "|---|---|---|"]
     for ts, exact, side, step in rows:
         when = ts[11:19] if ts else "?"
