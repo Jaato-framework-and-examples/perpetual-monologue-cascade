@@ -64,6 +64,12 @@ _load_env_file(ENV_FILE)
 #: Identifies this run's archived artifacts.
 _run_id = time.strftime("%H%M%S")
 
+#: percent_used probe state — events seen per agent, and how many
+#: zero-readings have been reported (capped, so a genuinely-unknown
+#: provider does not fill the log with a correct answer).
+_pct_seen: dict = {}
+_pct_zero: dict = {}
+
 #: Short on purpose: AF_UNIX caps a socket path at 108 bytes and fails
 #: opaquely past it.
 SOCKET = os.environ.get("JAATO_IPC_SOCKET", "/tmp/monologue.sock")
@@ -367,6 +373,34 @@ async def main():
                             and getattr(ev, "tool_name", "") == "send_to_sibling")):
                     last_activity = time.monotonic()
 
+                # PERCENT_USED PROBE. This field rides the event stream and
+                # is NEVER written daemon-side, so grepping the daemon log
+                # for it returns zero whatever is happening — a blind
+                # instrument reporting a clean result. That zero nearly went
+                # upstream as a passed expectation.
+                #
+                # BOTH numbers or neither. `percent_used == 0` means two
+                # opposite things and one field cannot separate them: with a
+                # real `context_limit` it is a stale cache and a regression;
+                # with `context_limit == 0` it is an honest-unknown provider
+                # (#541) correctly declining to divide by a denominator it
+                # does not have. Printing the percentage alone would rebuild
+                # the same trap one layer up.
+                if getattr(ev, "type", None) in (EventType.TURN_PROGRESS,
+                                                 EventType.CONTEXT_UPDATED):
+                    pct = getattr(ev, "percent_used", None)
+                    lim = getattr(ev, "context_limit", None)
+                    who = getattr(ev, "agent_id", "?")
+                    _pct_seen[who] = _pct_seen.get(who, 0) + 1
+                    if pct == 0 and _pct_zero.get(who, 0) < 3:
+                        _pct_zero[who] = _pct_zero.get(who, 0) + 1
+                        verdict = ("honest-unknown: no context limit to "
+                                   "divide by" if not lim else
+                                   "STALE CACHE — a real limit with 0% used")
+                        print(f"[{_stamp()}] ?? {who} percent_used=0 "
+                              f"context_limit={lim} ({verdict}) "
+                              f"[event {_pct_seen[who]}]", flush=True)
+
                 # THE CEILING. A budget refusal runs no turn and produces no
                 # turn-completion notification, so this event is the ONLY
                 # in-band signal that the mind is over (core.py:4308-4348).
@@ -497,6 +531,25 @@ async def main():
         # session the client LEAVES. So attach to the subconscient, then
         # back to the conscient — that saves the subconscient — and let
         # disconnect save the conscient on the way out.
+        # WHAT THE PROBE SAW, including when it saw nothing wrong.
+        #
+        # A probe that only speaks on a hit is indistinguishable from a
+        # probe that never ran — which is the exact failure it was added to
+        # close. So it reports its own coverage: "N events, 0 zero-readings"
+        # is a null with a working instrument behind it, and "0 events" says
+        # the stream carried none and the question is still open.
+        if _pct_seen:
+            for who in sorted(_pct_seen):
+                z = _pct_zero.get(who, 0)
+                print(f"[{_stamp()}] .. percent_used probe: {who} "
+                      f"{_pct_seen[who]} progress/context events, "
+                      f"{z or 'no'} zero-reading{'' if z == 1 else 's'}",
+                      flush=True)
+        else:
+            print(f"[{_stamp()}] .. percent_used probe: NO progress or "
+                  "context events reached the driver — the expectation is "
+                  "untested, not passed.", flush=True)
+
         # ARCHIVE THE TRACES BEFORE THE NEXT RUN CAN OVERWRITE THEM.
         # A fixed trace path plus `rm` before each run destroyed run 21's
         # fourteen-stall sample — the one that would have answered whether
