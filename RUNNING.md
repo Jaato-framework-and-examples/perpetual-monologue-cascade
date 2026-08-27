@@ -77,6 +77,8 @@ echo "what about the retry loop?" | python3 whisper.py
 python3 whisper.py --urgent "stop and answer me"
 python3 unload.py <session_id>            # save one transcript, daemon stays up
 python3 analyze_run.py                    # what one run's artifacts can answer
+python3 switch_model.py subconscient --list
+python3 switch_model.py subconscient anthropic/claude-sonnet-5
 ```
 
 `whisper` offers a thought the mind may ignore; `--urgent` interrupts and
@@ -86,6 +88,20 @@ enforces, not a wording choice — README §8.1.
 `unload` is how you get a transcript. **Never `delete_session`** — it
 destroys the transcript rather than saving it. The driver unloads by
 attaching away on shutdown for the same reason.
+
+`switch_model` is not for changing models. `/model select` invalidates the
+daemon's cached context limit, and in a healthy session that cache is filled
+before any progress event fires — so the miss path that emits
+`percent_used=0` never runs, and a whole clean run says nothing about it.
+This is the only cheap way to make it run. After a switch, watch the
+driver's `?? ... percent_used=0` lines: at most one honest-unknown reading
+(percent AND limit both zero) then a healed non-zero is correct; a
+persistent zero or a ~10s stall is a regression.
+
+It exits non-zero if the switch did not take, because **an unverified
+stimulus makes the reading that follows worthless** — the first version of
+this tool sent the wrong argument shape, was refused, and produced a
+clean-looking null about a cache that had never been invalidated.
 
 ## The knobs that matter
 
