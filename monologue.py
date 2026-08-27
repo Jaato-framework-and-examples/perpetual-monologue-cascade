@@ -25,7 +25,8 @@ import os
 import time
 import uuid
 
-from jaato_sdk import ClientType, EventType, IPCRecoveryClient
+from jaato_sdk import (ClientType, EventType, IPCRecoveryClient,
+                       SessionCreateFailed)
 
 REPO = os.path.dirname(os.path.abspath(__file__))
 
@@ -212,12 +213,60 @@ async def main():
     # example uses DELIBERATELY to put a sibling to sleep. It was measured
     # not to unload an idle peer on 4138a9a5 (README §11 Q2), which is why
     # this order is safe as written rather than merely untested.
-    sub = await client.create_session(
-        profile="subconscient", agent="subconscient",
-        sibling_name="subconscient", cascade_driver_id=cid, timeout=60.0)
-    con = await client.create_session(
-        profile="conscient", agent="conscient",
-        sibling_name="conscient", cascade_driver_id=cid, timeout=60.0)
+    # `create_session` RAISES now (SDK #635) — it returns `str`, not
+    # `Optional[str]`. The old `if not sub or not con or not cur` guard
+    # below was dead the moment that shipped: the exception fires on the
+    # first failing create, before any check of the three.
+    #
+    # And a half-built cascade LEAKS. Creation happens outside the
+    # try/finally that owns shutdown, so a failure at `con` left `sub`
+    # running with its own runner subprocess and pool slot, and the driver
+    # exited without ever reaching `disconnect()`. That predates #635; the
+    # raise only makes it louder. The runner pool has no ceiling, so this
+    # bench was quietly able to manufacture the leak the pool-ceiling work
+    # is about.
+    created = []
+
+    async def _start(label, **kwargs):
+        try:
+            sid = await client.create_session(timeout=60.0, **kwargs)
+        except SessionCreateFailed as exc:
+            print(f"[{_stamp()}] !! {label} did not start: {exc}", flush=True)
+            print(f"   cause={exc.cause} may_exist={exc.may_exist}", flush=True)
+            if exc.may_exist:
+                # NOT a retry candidate. `session.new` has no idempotency
+                # key, so a blind retry on an unknown outcome creates a
+                # SECOND session with its own runner and slot — the leak
+                # this handler exists to avoid, doubled.
+                print("   the daemon may hold a session for this profile "
+                      "anyway; check `jaato-doctor` before rerunning.",
+                      flush=True)
+            await _unload(created)
+            raise SystemExit(f"cascade not started ({label})")
+        created.append((label, sid))
+        return sid
+
+    async def _unload(sessions):
+        """Give back what was already built.
+
+        Same gesture as the shutdown path below: `attach_session` unloads
+        the session the client LEAVES, so attaching through them in turn
+        and then disconnecting unloads each one. Never `delete_session` —
+        that destroys the transcript instead of saving it.
+        """
+        for label, sid in sessions:
+            print(f"[{_stamp()}] .. unloading orphaned {label}", flush=True)
+            with contextlib.suppress(Exception):
+                await client.attach_session(sid)
+        with contextlib.suppress(Exception):
+            await client.disconnect()
+
+    sub = await _start("subconscient", profile="subconscient",
+                       agent="subconscient", sibling_name="subconscient",
+                       cascade_driver_id=cid)
+    con = await _start("conscient", profile="conscient",
+                       agent="conscient", sibling_name="conscient",
+                       cascade_driver_id=cid)
     # THE THIRD RESIDENT FACULTY. Same cid — so it is inside the one budget
     # ceiling and on the one event stream — but NO sibling_name, so it does
     # not appear in list_siblings and neither half can address it. The thing
@@ -225,12 +274,8 @@ async def main():
     # them. Like the halves it declares no completion schema and so cannot
     # decide it is finished; unlike them it has no send invariant, because
     # it is woken rather than self-sustaining.
-    cur = await client.create_session(
-        profile="curator", agent="curator",
-        cascade_driver_id=cid, timeout=60.0)
-    if not sub or not con or not cur:
-        raise SystemExit(f"a session did not start "
-                         f"(sub={sub} con={con} curator={cur})")
+    cur = await _start("curator", profile="curator", agent="curator",
+                       cascade_driver_id=cid)
 
     # EXPLICIT, not incidental. create_session attaches the creating client
     # (session_manager.py:6057), so without this the driver is attached to
