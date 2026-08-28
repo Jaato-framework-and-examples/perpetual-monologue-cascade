@@ -151,6 +151,15 @@ def render(ev):
         # the deliveries are collateral. Turning them off separates my
         # instrumentation from the framework's loop: if the stalls vanish,
         # the contention was mine.
+        # KNOWN UNRESOLVED, and recorded rather than left as a puzzle for
+        # the next reader. With the flag set and a populated session_id,
+        # this branch appends and the drain below runs immediately — and on
+        # runs 45, 49, 50 and 51 NO `session.save` reached the daemon, while
+        # run 46 produced six from the identical launch. Verified at the
+        # decision point with a temporary probe: flag='1', sid populated,
+        # no exception raised, nothing arrives. The two silences below were
+        # found and closed while chasing it; the inconsistency itself is
+        # still open. Off by default, so it costs a diagnostic, not a run.
         if os.environ.get("MONOLOGUE_SAVE_PER_SEND") == "1":
             # PLAIN ATTRIBUTE, not getattr with a default. The scaffolded
             # observer archetype says why and it is this repo's own lesson
@@ -163,7 +172,18 @@ def render(ev):
             # carries session_id since protocol 1.2, so a raise here is a
             # real regression surfacing where it can be seen.
             sid = ev.session_id
-            if sid and sid not in _pending_saves:
+            if not sid:
+                # HALF A FIX IS NOT A FIX. Reading this as a plain attribute
+                # closed the MISSING case — a pre-1.2 server now raises where
+                # it can be seen. It left the EMPTY case exactly as silent as
+                # before: `if sid and ...` drops a blank id without a word,
+                # and the operator gets a transcript that never appears with
+                # nothing saying why. Absent and empty were the two halves;
+                # I fixed one and reported the pair as done.
+                print(f"[{_stamp()}] !! save skipped: {who} sent, but the "
+                      "event carried an EMPTY session_id — not missing, "
+                      "blank. Nothing to save against.", flush=True)
+            elif sid not in _pending_saves:
                 _pending_saves.append(sid)
     elif kind == EventType.AGENT_STATUS_CHANGED and getattr(ev, "status", "") == "done":
         _flush(who)
@@ -369,9 +389,19 @@ async def main():
                     return          # signal arrived; let the finally reap
                 render(ev)
                 while _pending_saves:
-                    with contextlib.suppress(Exception):
-                        await client.execute_command(
-                            "session.save", args=[_pending_saves.pop(0)])
+                    # A SUPPRESSED SAVE IS AN INVISIBLE ONE. This swallowed
+                    # every failure, so a save that never reached the daemon
+                    # looked identical to one that did — which is how a run
+                    # with the flag ON and SIX sends produced ZERO saves and
+                    # I could not tell whether the queue was empty or the
+                    # call was throwing. Suppress still (a failed save must
+                    # not kill the loop) but SAY SO.
+                    _sid = _pending_saves.pop(0)
+                    try:
+                        await client.execute_command("session.save", args=[_sid])
+                    except Exception as exc:
+                        print(f"[{_stamp()}] !! save failed for {_sid}: "
+                              f"{type(exc).__name__}: {exc}", flush=True)
                 # Only a THOUGHT resets the stall clock. Keying on any event
                 # made the watchdog useless in run 1: the cascade stream
                 # emits status/telemetry events continuously, so a mind that
