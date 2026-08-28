@@ -11,11 +11,28 @@ documented entrances to the trap #633 fixed. In a healthy session
 (core.py:2596), so the miss path at core.py:3297 NEVER RUNS and a whole
 clean run says nothing about it. This is the only cheap way to make it run.
 
+RESTART THE DAEMON FIRST IF THE FRAMEWORK MOVED. A daemon that predates
+the commit you are testing emits none of its log tokens no matter which
+path runs — and an absent token reads exactly like a path that did not
+execute. That is not hypothetical: it cost this bench a false negative on
+`CONTINUATION: Processing` earlier, and I would have skipped the restart
+here if jaato-30 had not said it in the instruction. Check with
+`ps -o lstart=` on the daemon pid before believing any absence.
+
 Expect, on the next progress events after a switch:
     at most ONE reading with percent_used=0 AND context_limit=0 together
     (honest-unknown, #541), then a healed non-zero.
 A PERSISTENT zero, or a ~10s stall around the switch, means the fix
-regressed. Watch the driver's own `?? ... percent_used=0` lines for it —
+regressed. Since #637 the daemon log says which happened rather than
+leaving it to be inferred — `CONTEXT_LIMIT_MISS` (the branch ran),
+`HEALED source=off_band_fill` / `source=usage_payload` (which writer
+refilled the cache), `HEAL_EMPTY` (#541 honest zero, correctly not
+cached), `HEAL_FAILED` (cache stays COLD — the state that used to be
+permanent and silent), `HEAL_SKIPPED` (declined, with the reason).
+MISS and HEAL_SKIPPED are complementary — the caller logs MISS only when
+the scheduler returns True, the scheduler logs SKIPPED when it returns
+False — so BOTH absent means the miss branch was never entered at all,
+which is a stronger statement than "no bad reading appeared". Watch the driver's own `?? ... percent_used=0` lines for it —
 this tool changes the state; monologue.py is what observes the result.
 
 THE RESULT ARRIVES AS AN EVENT, NOT A RETURN VALUE. `execute_command`
