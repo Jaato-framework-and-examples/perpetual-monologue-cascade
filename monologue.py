@@ -151,15 +151,22 @@ def render(ev):
         # the deliveries are collateral. Turning them off separates my
         # instrumentation from the framework's loop: if the stalls vanish,
         # the contention was mine.
-        # KNOWN UNRESOLVED, and recorded rather than left as a puzzle for
-        # the next reader. With the flag set and a populated session_id,
-        # this branch appends and the drain below runs immediately — and on
-        # runs 45, 49, 50 and 51 NO `session.save` reached the daemon, while
-        # run 46 produced six from the identical launch. Verified at the
-        # decision point with a temporary probe: flag='1', sid populated,
-        # no exception raised, nothing arrives. The two silences below were
-        # found and closed while chasing it; the inconsistency itself is
-        # still open. Off by default, so it costs a diagnostic, not a run.
+        # RESOLVED, and the answer was my own counter. I reported an
+        # inconsistency here — zero saves on four runs, six on a fifth from
+        # an identical launch — and there was none. `command_router` never
+        # LOGS session.save; it replies with a SystemMessageEvent. So the
+        # daemon log has nothing to match, and my `grep -c "session.save"`
+        # returned 0 correctly. Run 46's six were STACK FRAMES: three
+        # all-thread dumps, each quoting `_handle_session_save` twice in the
+        # traceback of the thread that was inside it. The counter was
+        # measuring whether a dump had happened.
+        #
+        # Saves worked the whole time. Run 46 is the proof: the thread the
+        # watchdog caught holding the manager lock was `asyncio_0`, inside
+        # `_handle_session_save`, which is a save in flight.
+        #
+        # So the outcome is read where it is actually reported — below, off
+        # the reply — instead of from a log that never carried it.
         if os.environ.get("MONOLOGUE_SAVE_PER_SEND") == "1":
             # PLAIN ATTRIBUTE, not getattr with a default. The scaffolded
             # observer archetype says why and it is this repo's own lesson
@@ -185,6 +192,12 @@ def render(ev):
                       "blank. Nothing to save against.", flush=True)
             elif sid not in _pending_saves:
                 _pending_saves.append(sid)
+    elif kind == EventType.SYSTEM_MESSAGE and "session.save" in (
+            getattr(ev, "message", "") or ""):
+        # THE ONLY PLACE A SAVE'S OUTCOME IS REPORTED. The daemon does not
+        # log it; it answers here. Reading it from the daemon log is what
+        # produced a phantom anomaly — see the note at the enqueue.
+        print(f"[{_stamp()}] .. {ev.message}", flush=True)
     elif kind == EventType.AGENT_STATUS_CHANGED and getattr(ev, "status", "") == "done":
         _flush(who)
 
@@ -396,11 +409,19 @@ async def main():
                     # I could not tell whether the queue was empty or the
                     # call was throwing. Suppress still (a failed save must
                     # not kill the loop) but SAY SO.
+                    # `execute_command` is FIRE AND FORGET — it returns
+                    # None and raises only if the socket write fails, so a
+                    # caught exception here means "did not reach the daemon",
+                    # never "did not save". The daemon answers separately:
+                    # SystemMessageEvent "written to disk" on success, or an
+                    # ErrorEvent with error_type=SessionSaveError when the
+                    # session is not loaded. Both are rendered below, so the
+                    # outcome is visible where it is actually reported.
                     _sid = _pending_saves.pop(0)
                     try:
                         await client.execute_command("session.save", args=[_sid])
                     except Exception as exc:
-                        print(f"[{_stamp()}] !! save failed for {_sid}: "
+                        print(f"[{_stamp()}] !! save NOT SENT for {_sid}: "
                               f"{type(exc).__name__}: {exc}", flush=True)
                 # Only a THOUGHT resets the stall clock. Keying on any event
                 # made the watchdog useless in run 1: the cascade stream
