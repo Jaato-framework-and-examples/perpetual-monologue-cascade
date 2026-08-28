@@ -152,7 +152,17 @@ def render(ev):
         # instrumentation from the framework's loop: if the stalls vanish,
         # the contention was mine.
         if os.environ.get("MONOLOGUE_SAVE_PER_SEND") == "1":
-            sid = getattr(ev, "session_id", None)
+            # PLAIN ATTRIBUTE, not getattr with a default. The scaffolded
+            # observer archetype says why and it is this repo's own lesson
+            # in someone else's words: `getattr(ev, "session_id", None)`
+            # returns None both when the field is MISSING and when it is
+            # blank, so it cannot tell "this event type carries no
+            # attribution" from "this event was not routed" — and against a
+            # pre-1.2 server every save would be skipped silently, leaving
+            # a missing transcript and nothing saying why. Every event
+            # carries session_id since protocol 1.2, so a raise here is a
+            # real regression surfacing where it can be seen.
+            sid = ev.session_id
             if sid and sid not in _pending_saves:
                 _pending_saves.append(sid)
     elif kind == EventType.AGENT_STATUS_CHANGED and getattr(ev, "status", "") == "done":
@@ -423,7 +433,7 @@ async def main():
                     print(f"\n[{_stamp()}] ── ceiling refused a spawn ──\n"
                           f"  exhausted: {d.get('exhausted_dimensions')}\n"
                           f"  remaining: {d.get('cascade_remaining')}\n"
-                          f"  session:   {getattr(ev, 'session_id', None)}",
+                          f"  session:   {ev.session_id}",
                           flush=True)
                     shutdown.set()
                     return
